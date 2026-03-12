@@ -90,7 +90,7 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 |   report_error    | 向上抛出异常 | 自定义错误码处理                                                                                           |
 |        dl         |    下载器    | 下载器 hook 点，可自定义下载器或覆写原生下载器逻辑                                                         |
 
-- [错误码对照表详情](docs/error_code.md)
+- [错误码对照表详情](yt_dlp_plugins/docs/error_code.md)
 
 ## 自定义提取器
 
@@ -132,4 +132,4 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 | \_download_webpage_handle |    Tuple     | 配置信息下载器                                                            |
 |     \_request_webpage     |   response   | urllib 请求发送器，粒度更细，可在提交请求时更改请求信息，如 m3u8 清单下载 |
 
-- [hook点对照表详情](docs/hook_detail.md)
+- [hook点对照表详情](yt_dlp_plugins/docs/hook_detail.md)
