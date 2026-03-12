@@ -55,7 +55,7 @@ use_custom_download_webpage_handle    自定义web页面下载程序开关，在
 use_custom_sabr                       指定使用 player 生成 potoken的客户端，例如：["web_safari"]，多个客户端使用逗号（,）分割
 ```
 
-## 自定义功能简介
+## 自定义功能
 
 > 位于yt_dlp_plugins/custom_youtube_dl.py 中，为自定义功能实现，通过对 YoutubeDL 方法或属性的覆盖或重写，达到自定义的业务目标
 
