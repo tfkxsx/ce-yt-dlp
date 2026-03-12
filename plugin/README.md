@@ -1,6 +1,6 @@
 ## 项目简介
 
-`yt_dlp_plugins` 全称 `Custom Extension yt-dlp`, 是对 `yt-dlp` 的外部插件集合，提供可按需开启的定制能力，在不改动核心库的前提下切换到增强版 `YoutubeDL` 及自定义 `YouTube` 提取器。
+`ce-yt-dlp` 全称 `Custom Extension yt-dlp`, 是对 `yt-dlp` 的外部插件集合，提供可按需开启的定制能力，在不改动核心库的前提下切换到增强版 `YoutubeDL` 及自定义 `YouTube` 提取器。
 
 ## 目录
 
@@ -52,6 +52,7 @@ use_custom_writeautomaticsub          多字幕下载时写入字幕失败仅告
 use_custom_plugins                    自定义插件总开关, 默认关闭状态（False）使用原生 YoutubeIE功能，设置为True 开启自定义功能。
 use_custom_player_client              自定义播放器客户端列表，例如：["tv", "web_safari", "android_sdkless"], 注意此功能优先级高于原生       extractor_args的设置
 use_custom_download_webpage_handle    自定义web页面下载程序开关，在原生下载器出问题时可进行切换。默认关闭状态（False）， 设置为True 开启。
+use_custom_sabr                       指定使用 player 生成 potoken的客户端，例如：["web_safari"]，多个客户端使用逗号（,）分割
 ```
 
 ## 自定义功能简介

@@ -3,6 +3,12 @@
 import urllib
 import requests
 from yt_dlp.extractor.youtube import YoutubeIE as _YoutubeIE
+from yt_dlp.utils import (
+    NO_DEFAULT,
+    traverse_obj,
+)
+from yt_dlp.extractor.youtube.pot.provider import PoTokenContext, PoTokenRequest
+from yt_dlp.utils.networking import clean_headers, clean_proxies, select_proxy
 
 
 class NO_DEFAULT:
@@ -95,7 +101,7 @@ class YoutubeIE(_YoutubeIE):
                     params=query,
                     headers=headers,
                     proxies=proxies,
-                    timeout=10,
+                    timeout=20,
                 )
                 response.encoding = response.apparent_encoding
                 return (response.text, None)
@@ -109,7 +115,7 @@ class YoutubeIE(_YoutubeIE):
                     data=data,
                     headers=headers,
                     proxies=proxies,
-                    timeout=10,
+                    timeout=20,
                 )
                 response.encoding = response.apparent_encoding
                 return (response.text, None)
@@ -124,7 +130,7 @@ class YoutubeIE(_YoutubeIE):
                     data=data,
                     headers=headers,
                     proxies=proxies,
-                    timeout=10,
+                    timeout=20,
                 )
                 response.encoding = response.apparent_encoding
                 return (response.text, None)
@@ -163,7 +169,7 @@ class YoutubeIE(_YoutubeIE):
                     data=data,
                     headers=headers,
                     proxies=proxies,
-                    timeout=10,
+                    timeout=20,
                 )
                 response.encoding = response.apparent_encoding
                 content = response.text
@@ -242,3 +248,65 @@ class YoutubeIE(_YoutubeIE):
             impersonate,
             require_impersonation,
         )
+
+    def _fetch_po_token(self, client, **kwargs):
+        if not self.enable_custom or not self.get_param("use_custom_sabr"):
+            return super()._fetch_po_token(client, **kwargs)
+
+        context = kwargs.get('context')
+        custom_sabr_client = [self.get_param("use_custom_sabr")] if isinstance(self.get_param("use_custom_sabr"), str) else self.get_param("use_custom_sabr")
+
+        if client in custom_sabr_client and context != "player":
+            context = "player"
+            kwargs['required'] = True
+
+        # Avoid fetching PO Tokens when not required
+        fetch_pot_policy = self._configuration_arg('fetch_pot', [''], ie_key=YoutubeIE)[0]
+        if fetch_pot_policy not in ('never', 'auto', 'always'):
+            fetch_pot_policy = 'auto'
+        if (
+            fetch_pot_policy == 'never'
+            or (
+                fetch_pot_policy == 'auto'
+                and not kwargs.get('required', False)
+            )
+        ):
+            return None
+
+        headers = self.get_param('http_headers').copy()
+        proxies = self._downloader.proxies.copy()
+        clean_headers(headers)
+        clean_proxies(proxies, headers)
+
+        innertube_host = self._select_api_hostname(None, default_client=client)
+
+        pot_request = PoTokenRequest(
+            context=PoTokenContext(context),
+            innertube_context=traverse_obj(kwargs, ('ytcfg', 'INNERTUBE_CONTEXT')),
+            innertube_host=innertube_host,
+            internal_client_name=client,
+            session_index=kwargs.get('session_index'),
+            player_url=kwargs.get('player_url'),
+            video_webpage=kwargs.get('video_webpage'),
+            is_authenticated=self.is_authenticated,
+            visitor_data=kwargs.get('visitor_data'),
+            data_sync_id=kwargs.get('data_sync_id'),
+            video_id=kwargs.get('video_id'),
+            request_cookiejar=self._downloader.cookiejar,
+            _gvs_bind_to_video_id=kwargs.get('_gvs_bind_to_video_id', False),
+
+            # All requests that would need to be proxied should be in the
+            # context of www.youtube.com or the innertube host
+            request_proxy=(
+                select_proxy('https://www.youtube.com', proxies)
+                or select_proxy(f'https://{innertube_host}', proxies)
+            ),
+            request_headers=headers,
+            request_timeout=self.get_param('socket_timeout'),
+            request_verify_tls=not self.get_param('nocheckcertificate'),
+            request_source_address=self.get_param('source_address'),
+
+            bypass_cache=kwargs.get('bypass_cache', False),
+        )
+
+        return self._pot_director.get_po_token(pot_request)

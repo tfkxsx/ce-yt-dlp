@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import urllib
 import requests
 from yt_dlp.extractor.vimeo import VimeoIE as _VimeoIE
 
@@ -58,7 +57,7 @@ class VimeoIE(_VimeoIE):
                     params=query,
                     headers=headers,
                     proxies=proxies,
-                    timeout=10,
+                    timeout=20,
                 )
                 response.encoding = response.apparent_encoding
                 return (response.text, response)
