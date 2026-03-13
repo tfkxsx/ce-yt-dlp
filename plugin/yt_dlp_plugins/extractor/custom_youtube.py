@@ -2,6 +2,7 @@
 
 import urllib
 import requests
+from pathlib import Path
 from yt_dlp.extractor.youtube import YoutubeIE as _YoutubeIE
 from yt_dlp.utils import (
     NO_DEFAULT,
@@ -82,6 +83,45 @@ class YoutubeIE(_YoutubeIE):
         impersonate=None,
         require_impersonation=False,
     ):
+        if self.enable_custom and self.get_param("use_custom_jsc"):
+            # 使用猴子补丁， 替换load_script
+            from yt_dlp.extractor.youtube.jsc._builtin.vendor import load_script as original_load_script
+            import yt_dlp.extractor.youtube.jsc._builtin.vendor as vendor_module
+
+            def load_script(filename, error_hook=None):
+                if filename == 'yt.solver.core.js':
+                    path = Path(__file__).parent / filename
+                    with open(path, 'r', encoding="utf-8") as f:
+                        return f.read()
+                else:
+                    return original_load_script(filename, error_hook)
+            vendor_module.load_script = load_script
+
+            # 修改脚本hash值
+            preferences = {
+                provider: sum(pref(provider, requests) for pref in self._jsc_director.preferences)
+                for provider in self._jsc_director.providers.values()
+            }
+            ab = (
+                provider for provider in sorted(
+                    self._jsc_director.providers.values(), key=preferences.get, reverse=True)
+                if provider.is_available()
+                )
+            ac = next(ab)
+            for i in ac._ALLOWED_HASHES:
+                if i.value == "core":
+                    vv = ac._ALLOWED_HASHES[i]
+                    for ii in vv:
+                        if ii.value == "unminified":
+                            vv[ii] = "cabf54de294f5804c068ff9f24abb89e8e24bc84a4f85e10e6b3498225104c2c7f25fb275df958cf9b1a5e398ae560a627f683093b041f7be5e3ef588ea6a30c"
+                            break
+
+            # 配置option 参数
+            extractor_args = self._downloader.params.get('extractor_args')
+            youtube = extractor_args['youtube']
+            youtube['player_js_version'] = ['20521@18d29a11']
+            youtube['player_js_variant'] = ["es6"]
+
         # 这里返回一个元组或list， 其中content 是请求的结果 string类型， 第二个返回值没有实际使用， 仅仅占位。
         # 我们可以在这里使用reqeusts 库来覆盖原生方法，
         # 如果这是更改参数，那么建议在 self._request_webpage 中修改参数更合适
