@@ -55,6 +55,8 @@ use_custom_download_webpage_handle    自定义web页面下载程序开关，在
 use_custom_sabr                       指定使用 player 生成 potoken的客户端，例如：["web_safari"]，多个客户端使用逗号（,）分割
 use_custom_jsc                        使用插件自带的 yt.solver.core.js 脚本对 n/sig 重签名, 设置为True 开启。
 ```
+- [use_custom_jsc 详情](plugin/yt_dlp_plugins/docs/custom_ejs.md)
+
 
 ## 自定义功能
 
@@ -91,7 +93,7 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 |   report_error    | 向上抛出异常 | 自定义错误码处理                                                                                           |
 |        dl         |    下载器    | 下载器 hook 点，可自定义下载器或覆写原生下载器逻辑                                                         |
 
-- [错误码对照表详情](yt_dlp_plugins/docs/error_code.md)
+- [错误码对照表详情](plugin/yt_dlp_plugins/docs/error_code.md)
 
 ## 自定义提取器
 
@@ -133,4 +135,4 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 | \_download_webpage_handle |    Tuple     | 配置信息下载器                                                            |
 |     \_request_webpage     |   response   | urllib 请求发送器，粒度更细，可在提交请求时更改请求信息，如 m3u8 清单下载 |
 
-- [hook点对照表详情](yt_dlp_plugins/docs/hook_detail.md)
+- [hook点对照表详情](plugin/yt_dlp_plugins/docs/hook_detail.md)
