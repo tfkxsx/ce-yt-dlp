@@ -208,6 +208,9 @@ else:
                 'segment_dir': raw.get('segment_dir'),
                 'segment_dir_explicit': raw.get('segment_dir') is not None,
                 'merge_output': raw.get('merge_output'),
+                # 新增：窗口大小检测相关配置
+                'window_size_verify_attempts': raw.get('window_size_verify_attempts', 1),
+                'dynamic_start_enabled': raw.get('dynamic_start_enabled', True),
             }
 
         def _build_track_selectors(self, video_format, audio_format, caption_format):
@@ -612,7 +615,18 @@ else:
             # Warmup already covered segments 1..N, so the first concurrent window must start at N+1.
             # Starting at the next stride boundary can skip uncovered segments (e.g. 5,6,7).
             safe_window_start = warmup.samples[-1].sequence_number + 1
-            sample_target = max(config['window_start'], safe_window_start)
+            # 动态计算起始窗口
+            if config.get('dynamic_start_enabled', True):
+                sample_target = self._calculate_dynamic_start(
+                    safe_window_start=safe_window_start,
+                    window_start_config=config['window_start'],
+                    window_size=0,  # 暂时未知，稍后检测
+                    concurrency=config['thread_number'],
+                    total_segments=total_segments
+                )
+            else:
+                sample_target = max(config['window_start'], safe_window_start)
+            
             if total_segments and sample_target > total_segments:
                 raise DownloadError('window_start is beyond total_segments')
 
@@ -765,10 +779,55 @@ else:
                 'results': results,
             }
 
+        def _calculate_dynamic_start(self, safe_window_start, window_start_config, window_size, concurrency, total_segments):
+            """
+            动态计算起始窗口
+            考虑warmup结果、并发数、窗口对齐和性能优化
+            """
+            # 1. 基础起始位置：warmup后的下一个片段
+            base_start = safe_window_start
+            
+            # 2. 如果配置了window_start，使用较大值
+            config_start = window_start_config
+            start_candidate = max(base_start, config_start)
+            
+            # 3. 如果已知窗口大小，对齐到窗口边界（提高效率）
+            if window_size > 0:
+                # 对齐到最近的窗口边界
+                aligned_start = ((start_candidate - 1) // window_size) * window_size + 1
+            else:
+                aligned_start = start_candidate
+            
+            # 4. 考虑并发优化：如果并发数>1且窗口大小>1，可以交错起始位置
+            if concurrency > 1 and window_size > 1:
+                # 简单策略：主线程使用aligned_start，其他线程会有偏移
+                # 这里返回主起始位置，实际交错在窗口规划中处理
+                pass
+            
+            # 5. 确保不超过总片段数
+            if total_segments and aligned_start > total_segments:
+                # 如果超过，从末尾倒退一个窗口
+                aligned_start = max(1, total_segments - window_size + 1) if window_size > 0 else max(1, total_segments)
+            
+            # 6. 记录决策信息（用于调试）
+            self.to_screen(
+                f'[sabr-dynamic] dynamic_start: safe={safe_window_start}, '
+                f'config={window_start_config}, size={window_size}, '
+                f'concurrency={concurrency}, final={aligned_start}'
+            )
+            
+            return aligned_start
+
         def _detect_window_stride(self, sample_summary, target_sequence):
+            """
+            检测窗口大小（服务器返回的连续片段数）
+            使用增强算法提高可靠性
+            """
             sequences = sample_summary.get('target_sequences') or []
             if not sequences:
                 return 0
+            
+            # 方法1：从target_sequence开始的连续序列长度（保持向后兼容）
             expected = target_sequence
             found_target = False
             count = 0
@@ -781,7 +840,76 @@ else:
                     break
                 count += 1
                 expected += 1
-            return count
+            
+            # 如果找到了有效的连续序列，返回它
+            if count > 0:
+                return count
+            
+            # 方法2：如果没有从target_sequence开始的连续序列，尝试找出最大连续段
+            # 这可能是target_sequence不在返回序列中的情况
+            return self._detect_max_continuous_segment(sequences)
+        
+        def _detect_max_continuous_segment(self, sequences):
+            """
+            检测序列中的最大连续段长度
+            """
+            if not sequences:
+                return 0
+            
+            sorted_seq = sorted(sequences)
+            max_length = 1
+            current_length = 1
+            
+            for i in range(1, len(sorted_seq)):
+                if sorted_seq[i] == sorted_seq[i-1] + 1:
+                    current_length += 1
+                    max_length = max(max_length, current_length)
+                else:
+                    current_length = 1
+            
+            return max_length
+        
+        def _detect_window_size_robust(self, warmup, config, sample_target):
+            """
+            增强的窗口大小检测，支持多次验证
+            """
+            # 首先使用单个样本检测
+            sample_task = self._build_window_task(warmup, sample_target, rn=1)
+            sample_summary, _ = self._execute_window_task(sample_task, warmup)
+            initial_size = self._detect_window_stride(sample_summary, sample_target)
+            
+            if initial_size <= 0:
+                return 0
+            
+            # 如果配置了验证次数，执行额外验证
+            verify_attempts = config.get('window_size_verify_attempts', 1)
+            if verify_attempts <= 1:
+                return initial_size
+            
+            detected_sizes = [initial_size]
+            
+            # 执行额外验证请求
+            for attempt in range(1, verify_attempts):
+                # 选择不同的目标序列进行验证
+                verify_target = sample_target + (attempt * initial_size)
+                verify_task = self._build_window_task(warmup, verify_target, rn=1000 + attempt)
+                verify_summary, _ = self._execute_window_task(verify_task, warmup)
+                verify_size = self._detect_window_stride(verify_summary, verify_target)
+                
+                if verify_size > 0:
+                    detected_sizes.append(verify_size)
+                
+                # 如果连续两次检测结果一致，提前返回
+                if len(detected_sizes) >= 2 and len(set(detected_sizes[-2:])) == 1:
+                    break
+            
+            # 返回最常见的大小
+            from collections import Counter
+            if detected_sizes:
+                most_common = Counter(detected_sizes).most_common(1)[0][0]
+                return most_common
+            
+            return initial_size
 
         def _download_window_targets(self, config, warmup, state, state_path, segment_dir, targets):
             tasks = self._build_window_tasks(warmup, targets, start_rn=2)
@@ -1176,6 +1304,7 @@ else:
 
         def _merge_window_track(self, config, state, segment_dir, warmup):
             merged_outputs = {}
+            all_tracks_complete = True
 
             for format_key, fmt in (state.get('formats') or {}).items():
                 label = self._format_label(format_key, state)
@@ -1186,17 +1315,28 @@ else:
                     if sequence_key != 'init'
                 )
                 if not sequence_numbers:
+                    # 没有数据片段，标记为不完整
+                    all_tracks_complete = False
                     continue
 
-                missing_sequences = self._missing_sequences(sequence_numbers)
-                if missing_sequences:
-                    self.report_warning(
-                        f'SABR concurrent download is missing {len(missing_sequences)} sequence(s) '
-                        f'for format {label}: {self._format_missing_sequences(missing_sequences)}',
-                    )
+                # 检查完整性
+                is_complete, missing_sequences = self._check_track_completeness(
+                    track_state, warmup, format_key
+                )
+                
+                if not is_complete:
+                    all_tracks_complete = False
+                    if missing_sequences:
+                        self.report_warning(
+                            f'SABR concurrent download is missing {len(missing_sequences)} sequence(s) '
+                            f'for format {label}: {self._format_missing_sequences(missing_sequences)}',
+                        )
+                    # 根据需求：part 不完整就不合并
+                    continue
 
                 filename = fmt.get('filename')
                 if not filename:
+                    all_tracks_complete = False
                     continue
 
                 temp_output = self.temp_name(filename)
@@ -1225,7 +1365,66 @@ else:
                 merged_outputs[label] = final_output
                 self._report_track_finished(format_key, final_output, state, warmup)
 
+            # 返回合并结果和完整性状态
+            state['all_tracks_complete'] = all_tracks_complete
             return merged_outputs
+        
+        def _check_track_completeness(self, track_state, warmup, format_key):
+            """
+            检查轨道完整性
+            返回：(是否完整, 缺失序列列表)
+            """
+            # 获取所有序列号
+            sequence_numbers = sorted(
+                int(sequence_key)
+                for sequence_key in track_state
+                if sequence_key != 'init'
+            )
+            
+            if not sequence_numbers:
+                return False, []
+            
+            # 检查是否有缺失序列
+            missing_sequences = self._missing_sequences(sequence_numbers)
+            
+            # 检查是否覆盖了所有需要的片段
+            fmt = (warmup.formats or {}).get(format_key) or {}
+            info_dict = fmt.get('info_dict')
+            
+            if info_dict:
+                total_segments = info_dict.get('total_segments')
+                if total_segments and isinstance(total_segments, int):
+                    # 检查是否从1开始到total_segments都有覆盖
+                    expected_sequences = set(range(1, total_segments + 1))
+                    actual_sequences = set(sequence_numbers)
+                    
+                    # 找出所有缺失（包括开头和结尾的缺失）
+                    all_missing = sorted(expected_sequences - actual_sequences)
+                    if all_missing:
+                        missing_sequences = list(set(missing_sequences + all_missing))
+            
+            # 检查文件大小是否匹配预期（如果有预期大小）
+            downloaded_bytes = sum(item.get('size', 0) for item in track_state.values())
+            if info_dict:
+                expected_bytes = info_dict.get('filesize') or info_dict.get('filesize_approx')
+                if expected_bytes and downloaded_bytes > 0:
+                    # 允许10%的误差，因为压缩等原因
+                    tolerance = 0.1
+                    min_expected = expected_bytes * (1 - tolerance)
+                    max_expected = expected_bytes * (1 + tolerance)
+                    
+                    if not (min_expected <= downloaded_bytes <= max_expected):
+                        self.to_screen(
+                            f'[sabr-completeness] {format_key}: '
+                            f'downloaded={downloaded_bytes}, expected={expected_bytes}, '
+                            f'ratio={downloaded_bytes/expected_bytes:.2%}'
+                        )
+                        # 文件大小不匹配，但可能仍然可以继续
+                        # 不标记为不完整，只记录日志
+            
+            is_complete = len(missing_sequences) == 0
+            
+            return is_complete, missing_sequences
 
         def _missing_sequences(self, sequence_numbers):
             if not sequence_numbers:

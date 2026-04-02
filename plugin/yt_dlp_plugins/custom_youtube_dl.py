@@ -133,6 +133,80 @@ class CustomYoutubeDL(_YoutubeDL):
                     break
             raise err
 
+    def _calculate_total_filesize(self, info_dict):
+        """
+        计算总文件大小（合并音视频格式）
+        返回：总大小（字节），0表示无法计算大小
+        """
+        total_bytes = 0
+        
+        # 检查是否有requested_formats（音视频分离）
+        requested_formats = info_dict.get('requested_formats')
+        if requested_formats:
+            # 合并计算所有格式的大小
+            for fmt in requested_formats:
+                filesize = fmt.get('filesize') or fmt.get('filesize_approx')
+                if filesize:
+                    try:
+                        total_bytes += int(filesize)
+                    except (ValueError, TypeError):
+                        pass
+        else:
+            # 单个格式
+            filesize = info_dict.get('filesize') or info_dict.get('filesize_approx')
+            if filesize:
+                try:
+                    total_bytes = int(filesize)
+                except (ValueError, TypeError):
+                    pass
+        
+        return total_bytes  # 返回0或正数
+
+    def _adjust_sabr_concurrency_by_filesize(self, info_dict):
+        """
+        根据文件大小调整SABR并发配置
+        逻辑：
+        - 文件大小 ≥ 10MB：启用并发，使用用户指定的thread_number或默认4并发
+        - 文件大小 < 10MB：禁用并发，使用原始SABR下载（无并发）
+        - 文件大小为0：视为无法获取大小，保持现有配置
+        """
+        total_bytes = self._calculate_total_filesize(info_dict)
+        
+        MB = 1024 * 1024
+        threshold = 10 * MB  # 10MB阈值
+        
+        # 获取或初始化sabr_concurrency配置
+        sabr_config = self.params.get('sabr_concurrency', {})
+        if sabr_config is True:
+            sabr_config = {}
+        
+        # 如果文件大小为0，视为无法获取大小，保持现有配置
+        if total_bytes == 0:
+            self.to_screen('[sabr-auto] 无法获取文件大小，使用默认配置')
+            return
+        
+        file_size_mb = total_bytes / MB
+        
+        if total_bytes >= threshold:
+            # ≥10MB：启用并发
+            sabr_config['enabled'] = True
+            
+            # 使用用户指定的thread_number或默认4
+            if 'thread_number' not in sabr_config:
+                sabr_config['thread_number'] = 4
+            
+            self.to_screen(
+                f'[sabr-auto] 文件大小 {file_size_mb:.1f}MB ≥ 10MB，'
+                f'启用{sabr_config["thread_number"]}并发下载'
+            )
+        else:
+            # <10MB：禁用并发
+            sabr_config['enabled'] = False
+            self.to_screen(f'[sabr-auto] 文件大小 {file_size_mb:.1f}MB < 10MB，小文件默认不开启并发下载')
+        
+        # 更新配置
+        self.params['sabr_concurrency'] = sabr_config
+
     def dl(self, name, info, subtitle=False, test=False):
         """
         原生下载器 hook 点
@@ -158,13 +232,18 @@ class CustomYoutubeDL(_YoutubeDL):
             params = self.params
 
         fd_class = get_suitable_downloader(info, params, to_stdout=(name == "-"))
+        
+        # 根据文件大小调整SABR并发配置（仅非测试模式）
+        if not test and fd_class.FD_NAME == "sabr":
+            self._adjust_sabr_concurrency_by_filesize(info)
+        
         # hook 内部下载器, 覆盖为自定义下载器
         if fd_class.FD_NAME == "http":
             self.write_debug(f"[CustomYoutubeDL] handling --> dl : http")
             fd_class = HttpFD
-        elif fd_class.FD_NAME == "sabr" and not self.params.get("sabr_concurrency", {}).get("enabled"):
+        elif fd_class.FD_NAME == "sabr":
             self.write_debug(f"[CustomYoutubeDL] handling --> dl : sabr")
-            # 这里可以替换为自定义的 SABR 下载器
+            # 替换为自定义的 SABR 下载器（包含并发功能）
             fd_class = SabrFD
         fd = fd_class(self, params)
         if not test:
