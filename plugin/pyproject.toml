@@ -16,7 +16,10 @@ keywords = ["yt-dlp", "yt-dlp-plugin"]
 maintainers = [
   { name = "tf", email = "tfkxsx@gmail.com" },
 ]
-dependencies = ["yt-dlp"]
+dependencies = [
+    "yt-dlp",
+    "psutil>=5.9.0"
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["yt_dlp_plugins"]

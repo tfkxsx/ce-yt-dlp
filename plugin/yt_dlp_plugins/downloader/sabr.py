@@ -218,6 +218,10 @@ else:
                 'adaptive_threshold_success': raw.get('adaptive_threshold_success', 0.8),  # 成功率阈值
                 'adaptive_threshold_response_ms': raw.get('adaptive_threshold_response_ms', 5000),  # 响应时间阈值
                 'priority_scheduling_enabled': raw.get('priority_scheduling_enabled', True),
+                # 新增：并发合并配置
+                'merge_concurrency': raw.get('merge_concurrency'),  # 合并并发数，None表示自动计算
+                'enable_concurrent_merge': raw.get('enable_concurrent_merge', True),  # 是否启用并发合并
+                'intermediate_file_prefix': raw.get('intermediate_file_prefix', '.sabr_merge_'),  # 中间文件前缀
             }
 
         def _build_track_selectors(self, video_format, audio_format, caption_format):
@@ -1464,29 +1468,15 @@ else:
                     all_tracks_complete = False
                     continue
 
-                temp_output = self.temp_name(filename)
-                output_dir = os.path.dirname(temp_output)
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-
-                with open(temp_output, 'wb') as out_fp:
-                    init_info = track_state.get('init')
-                    if init_info and os.path.isfile(init_info['path']):
-                        with open(init_info['path'], 'rb') as in_fp:
-                            out_fp.write(in_fp.read())
-
-                    for sequence_number in sequence_numbers:
-                        record = track_state.get(str(sequence_number))
-                        if not record:
-                            continue
-                        path = record.get('path')
-                        if not path or not os.path.isfile(path):
-                            continue
-                        with open(path, 'rb') as in_fp:
-                            out_fp.write(in_fp.read())
-
-                self.try_rename(temp_output, self.undo_temp_name(temp_output))
-                final_output = self.undo_temp_name(temp_output)
+                # 使用并发合并功能
+                final_output = self._concurrent_merge_track(
+                    config=config,
+                    track_state=track_state,
+                    filename=filename,
+                    label=label,
+                    sequence_numbers=sequence_numbers
+                )
+                
                 merged_outputs[label] = final_output
                 self._report_track_finished(format_key, final_output, state, warmup)
 
@@ -1629,6 +1619,382 @@ else:
                 shift += 8
 
             return result
+
+        def _calculate_optimal_merge_concurrency(self, total_sequences, total_size_bytes=None, label=""):
+            """
+            计算最优合并并发数（带优雅降级）
+            """
+            try:
+                import psutil
+                # 使用完整算法（如果有psutil）
+                return self._calculate_concurrency_with_psutil(total_sequences, total_size_bytes, label)
+            except ImportError:
+                # 使用简化算法（无psutil）
+                self.to_screen(f'[sabr-merge] psutil not available, using simplified algorithm for {label}')
+                return self._calculate_simple_concurrency(total_sequences, total_size_bytes, label)
+
+        def _calculate_concurrency_with_psutil(self, total_sequences, total_size_bytes=None, label=""):
+            """
+            使用psutil的完整算法
+            """
+            import os
+            import sys
+            
+            # 1. 基础CPU核心数
+            cpu_cores = os.cpu_count() or 1
+            
+            # 2. 可用内存考虑（避免内存溢出）
+            memory_info = psutil.virtual_memory()
+            memory_gb = memory_info.available / (1024**3)
+            
+            # 3. 磁盘类型推断（简化版本）
+            # 检查/tmp目录或工作目录所在文件系统
+            disk_type = 'hdd'  # 默认保守假设为机械硬盘
+            try:
+                import psutil
+                disk_partitions = psutil.disk_partitions()
+                for partition in disk_partitions:
+                    if partition.mountpoint in ['/', '/tmp', os.path.expanduser('~')]:
+                        # 检查是否为SSD（简化检查）
+                        # 实际上需要更复杂的检测，这里使用保守假设
+                        if 'ssd' in partition.opts.lower() or 'flash' in partition.opts.lower():
+                            disk_type = 'ssd'
+                        break
+            except:
+                pass
+            
+            # 4. 工作负载因子
+            workload_factor = 1.0
+            # 因子1：文件数量
+            sequence_factor = min(total_sequences / 100, 3.0)  # 文件越多，因子越高
+            
+            # 因子2：平均文件大小
+            avg_size_factor = 1.0
+            if total_size_bytes and total_sequences > 0:
+                avg_size_mb = total_size_bytes / (1024**2) / total_sequences
+                if avg_size_mb < 1:  # 小文件，适合高并发
+                    avg_size_factor = 1.5
+                elif avg_size_mb > 10:  # 大文件，限制并发
+                    avg_size_factor = 0.7
+            
+            workload_factor = sequence_factor * avg_size_factor
+            
+            # 5. 加权并发计算
+            # 基础并发：CPU核心数
+            base_concurrency = cpu_cores
+            
+            # 内存调整：每GB内存支持1个并发（保守估计）
+            memory_adjusted = min(base_concurrency, max(1, int(memory_gb)))
+            
+            # 磁盘类型调整
+            if disk_type == 'ssd':
+                disk_multiplier = 1.5  # SSD支持更高并发
+            elif disk_type == 'nvme':
+                disk_multiplier = 2.0  # NVMe支持更高并发
+            else:  # 机械硬盘
+                disk_multiplier = 0.7  # 机械硬盘降低并发
+            
+            # 工作负载调整
+            workload_adjusted = memory_adjusted * disk_multiplier * workload_factor
+            
+            concurrency = max(1, int(workload_adjusted))
+            
+            # 6. 边界调整
+            concurrency = self._adjust_concurrency_bounds(concurrency, total_sequences, label)
+            
+            # 记录决策信息
+            self.to_screen(
+                f'[sabr-merge] {label}: cpu_cores={cpu_cores}, memory_gb={memory_gb:.1f}, '
+                f'disk_type={disk_type}, workload_factor={workload_factor:.2f}, '
+                f'suggested_concurrency={concurrency}'
+            )
+            
+            return concurrency
+
+        def _calculate_simple_concurrency(self, total_sequences, total_size_bytes=None, label=""):
+            """
+            简化版并发计算（无psutil依赖）
+            """
+            import os
+            import sys
+            
+            # 基础：CPU核心数
+            cpu_cores = os.cpu_count() or 1
+            
+            # 根据平台调整
+            if sys.platform == 'darwin' or sys.platform.startswith('linux'):
+                # macOS/Linux：通常性能较好
+                base = min(cpu_cores, 8)
+            else:
+                # 其他平台保守一些
+                base = min(cpu_cores, 4)
+            
+            # 根据文件数量调整
+            if total_sequences < 30:
+                return 1  # 文件太少，无需并发
+            elif total_sequences < 100:
+                return min(base, 2)
+            elif total_sequences < 300:
+                return min(base, 4)
+            elif total_sequences < 500:
+                return min(base, 6)
+            else:
+                return min(base, 8)
+
+        def _adjust_concurrency_bounds(self, concurrency, total_sequences, label):
+            """
+            边界检查和调整
+            """
+            # 下限：至少1个并发
+            concurrency = max(1, concurrency)
+            
+            # 上限1：不超过总片段数的1/4（避免太多小分组）
+            if total_sequences > 0:
+                concurrency = min(concurrency, max(1, total_sequences // 4))
+            
+            # 上限2：绝对上限（避免过度并发）
+            absolute_max = 16  # 即使是强大服务器也不超过16并发
+            concurrency = min(concurrency, absolute_max)
+            
+            return concurrency
+
+        def _concurrent_merge_track(self, config, track_state, filename, label, sequence_numbers):
+            """
+            并发合并单个轨道
+            返回：最终输出文件路径
+            """
+            if not config.get('enable_concurrent_merge', True):
+                # 禁用并发合并，使用原始顺序合并
+                return self._sequential_merge_track(track_state, filename, sequence_numbers)
+            
+            # 计算最优并发数
+            total_sequences = len(sequence_numbers)
+            
+            # 估算总大小
+            total_size_bytes = sum(
+                track_state.get(str(seq), {}).get('size', 0)
+                for seq in sequence_numbers
+            )
+            
+            # 获取配置的并发数，如果没有则自动计算
+            merge_concurrency = config.get('merge_concurrency')
+            if merge_concurrency is None:
+                merge_concurrency = self._calculate_optimal_merge_concurrency(
+                    total_sequences, total_size_bytes, label
+                )
+            
+            # 边界检查
+            merge_concurrency = max(1, min(merge_concurrency, total_sequences))
+            
+            # 如果并发数为1或文件太少，使用顺序合并
+            if merge_concurrency <= 1 or total_sequences < 10:
+                self.to_screen(f'[sabr-merge] {label}: sequential merge (files={total_sequences})')
+                return self._sequential_merge_track(track_state, filename, sequence_numbers)
+            
+            # 记录并发合并信息
+            self.to_screen(
+                f'[sabr-merge] {label}: starting concurrent merge with {merge_concurrency} threads '
+                f'(files={total_sequences})'
+            )
+            
+            # 创建临时中间文件
+            intermediate_files = self._create_intermediate_files(
+                config, filename, merge_concurrency, label
+            )
+            
+            # 分组序列号
+            groups = self._group_sequences_for_concurrent_merge(
+                sequence_numbers, merge_concurrency
+            )
+            
+            # 并发合并到中间文件
+            self._merge_to_intermediate_files_concurrently(
+                track_state, groups, intermediate_files, label
+            )
+            
+            # 合并中间文件到最终文件
+            final_output = self._merge_intermediate_files_to_final(
+                intermediate_files, filename, label, track_state
+            )
+            
+            # 清理中间文件
+            self._cleanup_intermediate_files(intermediate_files)
+            
+            return final_output
+
+        def _sequential_merge_track(self, track_state, filename, sequence_numbers):
+            """
+            顺序合并轨道（原始实现）
+            """
+            temp_output = self.temp_name(filename)
+            output_dir = os.path.dirname(temp_output)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            with open(temp_output, 'wb') as out_fp:
+                init_info = track_state.get('init')
+                if init_info and os.path.isfile(init_info['path']):
+                    with open(init_info['path'], 'rb') as in_fp:
+                        out_fp.write(in_fp.read())
+
+                for sequence_number in sequence_numbers:
+                    record = track_state.get(str(sequence_number))
+                    if not record:
+                        continue
+                    path = record.get('path')
+                    if not path or not os.path.isfile(path):
+                        continue
+                    with open(path, 'rb') as in_fp:
+                        out_fp.write(in_fp.read())
+
+            self.try_rename(temp_output, self.undo_temp_name(temp_output))
+            return self.undo_temp_name(temp_output)
+
+        def _create_intermediate_files(self, config, filename, concurrency, label):
+            """
+            创建中间文件
+            """
+            intermediate_files = []
+            intermediate_prefix = config.get('intermediate_file_prefix', '.sabr_merge_')
+            
+            for i in range(concurrency):
+                intermediate_name = f'{intermediate_prefix}{label}_{i}.tmp'
+                intermediate_path = os.path.join(os.path.dirname(filename), intermediate_name)
+                intermediate_files.append(intermediate_path)
+            
+            return intermediate_files
+
+        def _group_sequences_for_concurrent_merge(self, sequence_numbers, concurrency):
+            """
+            为并发合并分组序列号
+            """
+            total_sequences = len(sequence_numbers)
+            if total_sequences <= 0:
+                return []
+
+            concurrency = max(1, min(concurrency, total_sequences))
+            base_group_size, remainder = divmod(total_sequences, concurrency)
+            groups = []
+            start = 0
+
+            # 连续区间分组，确保每个中间文件内部和最终拼接顺序都保持原始时序。
+            for group_index in range(concurrency):
+                extra = 1 if group_index < remainder else 0
+                end = start + base_group_size + extra
+                if start >= total_sequences:
+                    break
+                groups.append(sequence_numbers[start:end])
+                start = end
+
+            if not groups:
+                return []
+
+            group_sizes = [len(group) for group in groups]
+            group_ranges = [f'{group[0]}-{group[-1]}' for group in groups if group]
+            self.to_screen(
+                f'[sabr-merge] contiguous groups: sizes={group_sizes}, ranges={group_ranges} '
+                f'(min={min(group_sizes)}, max={max(group_sizes)})'
+            )
+
+            return groups
+
+        def _merge_to_intermediate_files_concurrently(self, track_state, groups, intermediate_files, label):
+            """
+            并发合并到中间文件
+            """
+            import concurrent.futures
+            
+            def merge_group(group, intermediate_file):
+                """合并单个分组到中间文件"""
+                with open(intermediate_file, 'wb') as out_fp:
+                    for sequence_number in group:
+                        record = track_state.get(str(sequence_number))
+                        if not record:
+                            continue
+                        path = record.get('path')
+                        if not path or not os.path.isfile(path):
+                            continue
+                        with open(path, 'rb') as in_fp:
+                            out_fp.write(in_fp.read())
+                return len(group)
+            
+            # 使用线程池并发合并
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as executor:
+                # 提交所有任务
+                future_to_group = {}
+                for i, (group, intermediate_file) in enumerate(zip(groups, intermediate_files)):
+                    if group:  # 只合并非空分组
+                        future = executor.submit(merge_group, group, intermediate_file)
+                        future_to_group[future] = (i, len(group))
+                
+                # 等待完成并报告进度
+                completed = 0
+                total = sum(len(g) for g in groups)
+                
+                for future in concurrent.futures.as_completed(future_to_group):
+                    i, group_size = future_to_group[future]
+                    try:
+                        merged_count = future.result()
+                        completed += merged_count
+                        self.to_screen(
+                            f'[sabr-merge] group {i}: merged {merged_count}/{group_size} files '
+                            f'({completed}/{total} total, {completed/total*100:.1f}%)'
+                        )
+                    except Exception as e:
+                        self.to_screen(f'[sabr-merge] error in group {i}: {e}')
+
+        def _merge_intermediate_files_to_final(self, intermediate_files, filename, label, track_state=None):
+            """
+            合并中间文件到最终文件
+            参数:
+                intermediate_files: 中间文件列表
+                filename: 最终输出文件名
+                label: 轨道标签（用于日志）
+                track_state: 轨道状态字典（可选，用于获取init段）
+            """
+            temp_output = self.temp_name(filename)
+            output_dir = os.path.dirname(temp_output)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            with open(temp_output, 'wb') as out_fp:
+                # 首先写入init段（如果有）
+                if track_state:
+                    init_info = track_state.get('init')
+                    if init_info and os.path.isfile(init_info.get('path', '')):
+                        try:
+                            with open(init_info['path'], 'rb') as in_fp:
+                                out_fp.write(in_fp.read())
+                            self.to_screen(f'[sabr-merge] {label}: wrote init segment')
+                        except Exception as e:
+                            self.to_screen(f'[sabr-merge] {label}: error writing init segment: {e}')
+
+                # 合并所有中间文件
+                for intermediate_file in intermediate_files:
+                    if os.path.exists(intermediate_file):
+                        try:
+                            with open(intermediate_file, 'rb') as in_fp:
+                                out_fp.write(in_fp.read())
+                        except Exception as e:
+                            self.to_screen(f'[sabr-merge] {label}: error merging {intermediate_file}: {e}')
+
+            self.try_rename(temp_output, self.undo_temp_name(temp_output))
+            final_output = self.undo_temp_name(temp_output)
+
+            self.to_screen(f'[sabr-merge] {label}: merged {len(intermediate_files)} intermediate files to final output')
+
+            return final_output
+
+        def _cleanup_intermediate_files(self, intermediate_files):
+            """
+            清理中间文件
+            """
+            for intermediate_file in intermediate_files:
+                if os.path.exists(intermediate_file):
+                    try:
+                        os.remove(intermediate_file)
+                    except OSError:
+                        pass  # 忽略清理错误
 
         def _log_window_download(self, window_report):
             self.to_screen(
