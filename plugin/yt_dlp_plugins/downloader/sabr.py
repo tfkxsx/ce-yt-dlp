@@ -66,6 +66,7 @@ else:
     from yt_dlp.extractor.youtube._streaming.ump import UMPDecoder, UMPPartId
     from yt_dlp.networking import Request
     from yt_dlp.networking.exceptions import HTTPError, TransportError
+    import math
 
     @dataclasses.dataclass
     class SabrSegmentSample:
@@ -211,6 +212,12 @@ else:
                 # 新增：窗口大小检测相关配置
                 'window_size_verify_attempts': raw.get('window_size_verify_attempts', 1),
                 'dynamic_start_enabled': raw.get('dynamic_start_enabled', True),
+                # 新增：动态窗口规划器配置
+                'window_planning_mode': raw.get('window_planning_mode', 'interleaved'),  # 'sequential', 'interleaved', 'adaptive'
+                'interleaving_enabled': raw.get('interleaving_enabled', True),
+                'adaptive_threshold_success': raw.get('adaptive_threshold_success', 0.8),  # 成功率阈值
+                'adaptive_threshold_response_ms': raw.get('adaptive_threshold_response_ms', 5000),  # 响应时间阈值
+                'priority_scheduling_enabled': raw.get('priority_scheduling_enabled', True),
             }
 
         def _build_track_selectors(self, video_format, audio_format, caption_format):
@@ -690,11 +697,19 @@ else:
             else:
                 raise DownloadError('window_count is required when total_segments is unavailable')
 
-            targets = [
-                sample_target + (index * window_stride)
-                for index in range(window_count)
-                if not total_segments or sample_target + (index * window_stride) <= total_segments
-            ]
+            # 使用动态窗口规划器生成窗口序列
+            targets = self._generate_window_plan(
+                config=config,
+                sample_target=sample_target,
+                window_count=window_count,
+                window_stride=window_stride,
+                concurrency=config['thread_number']
+            )
+            
+            # 确保targets不超过总片段数
+            if total_segments:
+                targets = [t for t in targets if t <= total_segments]
+            
             if not targets:
                 raise DownloadError('window_download produced no target windows')
 
@@ -910,6 +925,81 @@ else:
                 return most_common
             
             return initial_size
+        
+        def _generate_interleaved_targets(self, base_target, window_count, window_stride, concurrency):
+            """
+            生成交错窗口序列以提高并发效率
+            
+            参数:
+                base_target: 基础起始序列号
+                window_count: 总窗口数
+                window_stride: 窗口步长（通常为1）
+                concurrency: 并发数
+            
+            返回:
+                交错后的窗口序列列表
+            """
+            if concurrency <= 1 or window_count <= 1:
+                # 无并发或窗口数少，返回线性序列
+                return [base_target + (i * window_stride) for i in range(window_count)]
+            
+            # 交错算法：将窗口分成concurrency组，每组交错排列
+            # 例如：base_target=5, window_count=8, concurrency=4
+            # 线性序列：[5, 6, 7, 8, 9, 10, 11, 12]
+            # 交错序列：[5, 9, 6, 10, 7, 11, 8, 12]
+            
+            targets = []
+            for group in range(concurrency):
+                for i in range(group, window_count, concurrency):
+                    target = base_target + (i * window_stride)
+                    targets.append(target)
+            
+            return targets
+        
+        def _generate_window_plan(self, config, sample_target, window_count, window_stride, concurrency):
+            """
+            根据配置生成窗口规划
+            
+            参数:
+                config: 配置字典
+                sample_target: 样本起始序列号
+                window_count: 总窗口数
+                window_stride: 窗口步长
+                concurrency: 并发数
+            
+            返回:
+                规划后的窗口序列列表
+            """
+            planning_mode = config.get('window_planning_mode', 'interleaved')
+            interleaving_enabled = config.get('interleaving_enabled', True)
+            
+            if planning_mode == 'sequential' or not interleaving_enabled:
+                # 线性序列模式
+                targets = [sample_target + (i * window_stride) for i in range(window_count)]
+            elif planning_mode == 'interleaved':
+                # 交错模式
+                targets = self._generate_interleaved_targets(
+                    sample_target, window_count, window_stride, concurrency
+                )
+            elif planning_mode == 'adaptive':
+                # 自适应模式（暂时使用交错模式）
+                # TODO: 实现自适应逻辑
+                targets = self._generate_interleaved_targets(
+                    sample_target, window_count, window_stride, concurrency
+                )
+            else:
+                # 默认使用线性序列
+                targets = [sample_target + (i * window_stride) for i in range(window_count)]
+            
+            # 记录规划信息（用于调试）
+            self.to_screen(
+                f'[sabr-planning] mode={planning_mode}, '
+                f'interleaving={interleaving_enabled}, '
+                f'concurrency={concurrency}, '
+                f'targets={len(targets)}'
+            )
+            
+            return targets
 
         def _download_window_targets(self, config, warmup, state, state_path, segment_dir, targets):
             tasks = self._build_window_tasks(warmup, targets, start_rn=2)
@@ -960,15 +1050,50 @@ else:
             if not missing_by_track:
                 return []
 
-            targets = set()
+            # 收集所有缺失序列
+            all_missing = set()
             for missing_sequences in missing_by_track.values():
-                for sequence in missing_sequences:
-                    if sequence < window_start:
-                        targets.add(sequence)
-                    else:
-                        offset = sequence - window_start
-                        targets.add(window_start + ((offset // window_size) * window_size))
-            return sorted(targets)
+                all_missing.update(missing_sequences)
+            
+            if not all_missing:
+                return []
+            
+            # 方法1：基于窗口大小的修复（原始方法）
+            targets_by_window = set()
+            for sequence in all_missing:
+                if sequence < window_start:
+                    targets_by_window.add(sequence)
+                else:
+                    offset = sequence - window_start
+                    targets_by_window.add(window_start + ((offset // window_size) * window_size))
+            
+            # 方法2：直接修复缺失序列的前后窗口
+            # 对于每个缺失序列，也尝试它的前一个窗口（如果可能）
+            direct_targets = set()
+            for sequence in all_missing:
+                # 尝试前一个窗口（如果>0）
+                if sequence > window_start:
+                    prev_target = window_start + (((sequence - window_start - 1) // window_size) * window_size)
+                    direct_targets.add(prev_target)
+                # 尝试当前窗口
+                if sequence >= window_start:
+                    curr_target = window_start + (((sequence - window_start) // window_size) * window_size)
+                    direct_targets.add(curr_target)
+                # 尝试后一个窗口
+                if sequence >= window_start:
+                    next_target = window_start + (((sequence - window_start + 1) // window_size) * window_size)
+                    direct_targets.add(next_target)
+            
+            # 合并两种方法的修复目标
+            all_targets = sorted(targets_by_window.union(direct_targets))
+            
+            # 记录修复决策信息
+            self.to_screen(
+                f'[sabr-repair] missing_sequences={sorted(all_missing)[:10]}{"..." if len(all_missing) > 10 else ""}, '
+                f'window_size={window_size}, repair_targets={all_targets[:10]}{"..." if len(all_targets) > 10 else ""}'
+            )
+            
+            return all_targets
 
         def _load_window_state(self, state_path, segment_dir, warmup, stride, segment_dir_explicit):
             if os.path.isfile(state_path):
