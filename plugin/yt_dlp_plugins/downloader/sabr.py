@@ -7,8 +7,14 @@ import itertools
 import json
 import os
 import statistics
+import threading
 import time
 from typing import Any
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from yt_dlp.dependencies import protobug
 from yt_dlp.downloader import FileDownloader
@@ -670,23 +676,30 @@ else:
                 warmup=warmup,
             )
 
-            sample_task = self._build_window_task(warmup, sample_target, rn=1)
-            sample_summary, sample_segment_data = self._execute_window_task(sample_task, warmup)
-            stride = self._detect_window_stride(sample_summary, sample_target)
-            if stride <= 0:
-                raise DownloadError('Unable to detect SABR window stride from sample request')
-            state['stride'] = stride
-            self._save_window_state(state_path, state)
+            stride = state.get('stride') or 0
+            sample_summary = None
+            sample_duplicates = 0
+            sample_written = 0
+            if stride > 0:
+                self.to_screen(f'[sabr-resume] reusing persisted stride={stride} from {state_path}')
+            else:
+                sample_task = self._build_window_task(warmup, sample_target, rn=1)
+                sample_summary, sample_segment_data = self._execute_window_task(sample_task, warmup)
+                stride = self._detect_window_stride(sample_summary, sample_target)
+                if stride <= 0:
+                    raise DownloadError('Unable to detect SABR window stride from sample request')
+                state['stride'] = stride
+                self._save_window_state(state_path, state)
 
-            sample_duplicates, sample_written = self._persist_window_result(
-                state=state,
-                state_path=state_path,
-                segment_dir=segment_dir,
-                task=sample_task,
-                summary=sample_summary,
-                segment_data=sample_segment_data,
-                warmup=warmup,
-            )
+                sample_duplicates, sample_written = self._persist_window_result(
+                    state=state,
+                    state_path=state_path,
+                    segment_dir=segment_dir,
+                    task=sample_task,
+                    summary=sample_summary,
+                    segment_data=sample_segment_data,
+                    warmup=warmup,
+                )
 
             # 动态计算窗口大小和起始位置
             window_size = stride  # 检测到的窗口大小（服务器返回的连续片段数）
@@ -696,7 +709,7 @@ else:
             if config['window_count'] is not None:
                 window_count = max(0, config['window_count'])
             elif total_segments:
-                # 使用window_stride=1确保完全覆盖
+                # 默认按窗口跨度推进，降低重复窗口；repair阶段负责兜底补洞。
                 window_count = ((total_segments - sample_target) // window_stride) + 1
             else:
                 raise DownloadError('window_count is required when total_segments is unavailable')
@@ -727,7 +740,7 @@ else:
                 f'threads={config["thread_number"]} targets={len(targets)} pending={len(pending_targets)}',
             )
 
-            results = [sample_summary]
+            results = [sample_summary] if sample_summary else []
             duplicates = sample_duplicates
             written_sequences = sample_written
 
@@ -746,16 +759,25 @@ else:
 
             repaired_targets = []
             for repair_round in range(config['repair_rounds']):
-                missing_by_track = self._state_missing_sequences(state)
+                round_start = time.time()
+                missing_by_track = self._state_missing_sequences(state, warmup=warmup)
+                self.to_screen(
+                    f'[sabr-repair] round={repair_round + 1}/{config["repair_rounds"]} '
+                    f'missing={self._summarize_missing_by_track(missing_by_track)}'
+                )
                 # 使用window_size（即stride）作为修复参数
                 repair_targets = self._repair_targets_for_missing(state, missing_by_track, sample_target, stride)
                 if not repair_targets:
+                    self.to_screen(
+                        f'[sabr-repair] round={repair_round + 1}: no repair targets, '
+                        f'elapsed={time.time() - round_start:.2f}s'
+                    )
                     break
 
                 repaired_targets.extend(repair_targets)
                 self.to_screen(
                     f'[sabr-window] repair round {repair_round + 1}: '
-                    f'missing_windows={repair_targets}',
+                    f'targets={self._format_sequence_sample(repair_targets)}',
                 )
                 run_results, run_duplicates, run_written = self._download_window_targets(
                     config=config,
@@ -768,6 +790,13 @@ else:
                 duplicates += run_duplicates
                 written_sequences += run_written
                 results.extend(run_results)
+                remaining_missing = self._state_missing_sequences(state, warmup=warmup)
+                self.to_screen(
+                    f'[sabr-repair] round={repair_round + 1} done: '
+                    f'windows={len(repair_targets)} written={run_written} duplicates={run_duplicates} '
+                    f'remaining={self._summarize_missing_by_track(remaining_missing)} '
+                    f'elapsed={time.time() - round_start:.2f}s'
+                )
 
             merge_output = self._merge_window_track(
                 config=config,
@@ -1005,39 +1034,152 @@ else:
             
             return targets
 
+        def _format_sequence_sample(self, sequences, limit=8):
+            if not sequences:
+                return '[]'
+            sequences = list(sequences)
+            if len(sequences) <= limit:
+                return '[' + ', '.join(map(str, sequences)) + ']'
+            head = ', '.join(map(str, sequences[:limit]))
+            return f'[{head}, ...] ({len(sequences)} total)'
+
+        def _summarize_missing_by_track(self, missing_by_track):
+            if not missing_by_track:
+                return 'none'
+            parts = []
+            for label in sorted(missing_by_track):
+                missing = missing_by_track[label]
+                parts.append(f'{label}:count={len(missing)} sample={self._format_sequence_sample(missing, limit=6)}')
+            return '; '.join(parts)
+
+        def _window_tracks_complete(self, state, warmup, missing_by_track=None):
+            missing_by_track = missing_by_track if missing_by_track is not None else self._state_missing_sequences(state, warmup=warmup)
+            if missing_by_track:
+                return False
+
+            for format_key, fmt in (warmup.formats or {}).items():
+                label = self._format_label(format_key, state)
+                track_state = (state.get('tracks') or {}).get(label) or {}
+                sequence_numbers = sorted(
+                    int(sequence_key)
+                    for sequence_key in track_state
+                    if sequence_key != 'init'
+                )
+                if not sequence_numbers:
+                    return False
+                info_dict = fmt.get('info_dict') or {}
+                total_segments = info_dict.get('total_segments')
+                if total_segments and isinstance(total_segments, int):
+                    if sequence_numbers[-1] < total_segments or len(sequence_numbers) < total_segments:
+                        return False
+                    continue
+                expected_bytes = info_dict.get('filesize') or info_dict.get('filesize_approx')
+                if expected_bytes:
+                    downloaded_bytes = sum(
+                        item.get('size', 0)
+                        for sequence_key, item in track_state.items()
+                        if sequence_key != 'init'
+                    )
+                    if downloaded_bytes < expected_bytes * 0.99:
+                        return False
+                    continue
+                return False
+            return True
+
         def _download_window_targets(self, config, warmup, state, state_path, segment_dir, targets):
             tasks = self._build_window_tasks(warmup, targets, start_rn=2)
-            task_map = {task.target_sequence: task for task in tasks}
-
             results = []
             duplicates = 0
             written_sequences = 0
 
             if targets:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=config['thread_number']) as pool:
-                    future_map = {
-                        pool.submit(self._execute_window_task, task_map[target], warmup): task_map[target]
-                        for target in targets
-                    }
-                    for future in concurrent.futures.as_completed(future_map):
-                        task = future_map[future]
-                        summary, segment_data = future.result()
-                        duplicate_count, written_count = self._persist_window_result(
-                            state=state,
-                            state_path=state_path,
-                            segment_dir=segment_dir,
+                batch_start = time.time()
+                total_targets = len(tasks)
+                max_workers = max(1, min(config['thread_number'], total_targets))
+                self.to_screen(
+                    f'[sabr-window] dispatch: count={len(targets)} '
+                    f'threads={max_workers} targets={self._format_sequence_sample(sorted(targets))}'
+                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    task_iter = iter(tasks)
+                    future_map = {}
+                    submitted_count = 0
+                    completed_count = 0
+                    stop_submitting = False
+
+                    def submit_next_task():
+                        nonlocal submitted_count
+                        if stop_submitting:
+                            return False
+                        try:
+                            task = next(task_iter)
+                        except StopIteration:
+                            return False
+                        future_map[pool.submit(self._execute_window_task, task, warmup)] = task
+                        submitted_count += 1
+                        return True
+
+                    while len(future_map) < max_workers and submit_next_task():
+                        pass
+
+                    while future_map:
+                        done, _ = concurrent.futures.wait(
+                            future_map,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            task = future_map.pop(future)
+                            completed_count += 1
+                            window_start = time.time()
+                            summary, segment_data = future.result()
+                            duplicate_count, written_count = self._persist_window_result(
+                                state=state,
+                                state_path=state_path,
+                                segment_dir=segment_dir,
                             task=task,
                             summary=summary,
                             segment_data=segment_data,
-                            warmup=warmup,
-                        )
-                        duplicates += duplicate_count
-                        written_sequences += written_count
-                        results.append(summary)
+                                warmup=warmup,
+                            )
+                            duplicates += duplicate_count
+                            written_sequences += written_count
+                            results.append(summary)
+                            missing_by_track = self._state_missing_sequences(state, warmup=warmup)
+                            all_tracks_complete = self._window_tracks_complete(
+                                state, warmup, missing_by_track=missing_by_track)
+                            elapsed = time.time() - batch_start
+                            status = 'error' if summary.get('error') else 'ok'
+                            self.to_screen(
+                                f'[sabr-window] progress: done={completed_count}/{total_targets} '
+                                f'submitted={submitted_count}/{total_targets} in_flight={len(future_map)} '
+                                f'target={task.target_sequence} status={status} matched={summary.get("matched_target")} '
+                                f'written+={written_count} dup+={duplicate_count} '
+                                f'total_written={written_sequences} total_dup={duplicates} '
+                                f'missing={self._summarize_missing_by_track(missing_by_track)} '
+                                f'elapsed={elapsed:.2f}s'
+                            )
+                            if all_tracks_complete and not stop_submitting:
+                                stop_submitting = True
+                                skipped_targets = total_targets - submitted_count
+                                self.to_screen(
+                                    f'[sabr-window] convergence reached after target={task.target_sequence}: '
+                                    f'all tracks complete, skipping {skipped_targets} not-yet-submitted window(s)'
+                                )
+                            if not stop_submitting:
+                                submit_next_task()
+                elapsed = time.time() - batch_start
+                ok_results = sum(1 for result in results if not result.get('error'))
+                error_results = len(results) - ok_results
+                skipped_targets = total_targets - submitted_count
+                self.to_screen(
+                    f'[sabr-window] completed: count={len(targets)} submitted={submitted_count} skipped={skipped_targets} '
+                    f'ok={ok_results} error={error_results} written={written_sequences} duplicates={duplicates} '
+                    f'elapsed={elapsed:.2f}s'
+                )
 
             return results, duplicates, written_sequences
 
-        def _state_missing_sequences(self, state):
+        def _state_missing_sequences(self, state, warmup=None):
             missing = {}
             for label, track_state in (state.get('tracks') or {}).items():
                 sequence_numbers = sorted(
@@ -1045,9 +1187,19 @@ else:
                     for sequence_key in track_state
                     if sequence_key != 'init'
                 )
-                track_missing = self._missing_sequences(sequence_numbers)
+                track_missing = set(self._missing_sequences(sequence_numbers))
+                if warmup:
+                    for format_key, fmt in (warmup.formats or {}).items():
+                        if self._format_label(format_key, state) != label:
+                            continue
+                        info_dict = fmt.get('info_dict') or {}
+                        total_segments = info_dict.get('total_segments')
+                        if total_segments and isinstance(total_segments, int):
+                            expected = set(range(1, total_segments + 1))
+                            track_missing.update(expected - set(sequence_numbers))
+                        break
                 if track_missing:
-                    missing[label] = track_missing
+                    missing[label] = sorted(track_missing)
             return missing
 
         def _repair_targets_for_missing(self, state, missing_by_track, window_start, window_size):
@@ -1101,27 +1253,17 @@ else:
 
         def _load_window_state(self, state_path, segment_dir, warmup, stride, segment_dir_explicit):
             if os.path.isfile(state_path):
-                with open(state_path, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
+                try:
+                    with open(state_path, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                except Exception as err:
+                    self.report_warning(f'Ignoring invalid SABR state file {state_path}: {err}')
+                    state = {}
             else:
-                state = {
-                    'version': 1,
-                    'selected_format': warmup.format_name,
-                    'format_key': self._format_id_key(warmup.format_id),
-                    'formats': {
-                        format_key: {
-                            'display_name': fmt.get('display_name'),
-                            'kind': fmt.get('kind'),
-                            'filename': fmt.get('filename'),
-                        }
-                        for format_key, fmt in warmup.formats.items()
-                    },
-                    'stride': stride,
-                    'segment_dir': segment_dir,
-                    'segment_dir_explicit': segment_dir_explicit,
-                    'windows': {},
-                    'tracks': {},
-                }
+                state = {}
+
+            if not self._is_window_state_compatible(state, warmup):
+                state = self._new_window_state(segment_dir, warmup, stride, segment_dir_explicit)
 
             state.setdefault('windows', {})
             state.setdefault('tracks', {})
@@ -1135,9 +1277,81 @@ else:
             })
             state['segment_dir'] = segment_dir
             state['segment_dir_explicit'] = segment_dir_explicit
-            state['stride'] = stride
+            state['stride'] = stride or state.get('stride') or 0
+            self._prune_window_state(state)
             self._save_window_state(state_path, state)
             return state
+
+        def _new_window_state(self, segment_dir, warmup, stride, segment_dir_explicit):
+            return {
+                'version': 1,
+                'selected_format': warmup.format_name,
+                'format_key': self._format_id_key(warmup.format_id),
+                'formats': {
+                    format_key: {
+                        'display_name': fmt.get('display_name'),
+                        'kind': fmt.get('kind'),
+                        'filename': fmt.get('filename'),
+                    }
+                    for format_key, fmt in warmup.formats.items()
+                },
+                'stride': stride,
+                'segment_dir': segment_dir,
+                'segment_dir_explicit': segment_dir_explicit,
+                'windows': {},
+                'tracks': {},
+            }
+
+        def _is_window_state_compatible(self, state, warmup):
+            if not isinstance(state, dict) or not state:
+                return False
+
+            current_format_key = self._format_id_key(warmup.format_id)
+            if state.get('format_key') != current_format_key:
+                return False
+
+            current_formats = {
+                format_key: {
+                    'display_name': fmt.get('display_name'),
+                    'kind': fmt.get('kind'),
+                    'filename': fmt.get('filename'),
+                }
+                for format_key, fmt in (warmup.formats or {}).items()
+            }
+            state_formats = state.get('formats') or {}
+            for format_key, fmt in current_formats.items():
+                existing = state_formats.get(format_key)
+                if not existing:
+                    return False
+                if existing.get('filename') != fmt.get('filename') or existing.get('kind') != fmt.get('kind'):
+                    return False
+            return True
+
+        def _prune_window_state(self, state):
+            track_paths = set()
+            for label, track_state in list((state.get('tracks') or {}).items()):
+                for sequence_key, item in list(track_state.items()):
+                    path = (item or {}).get('path')
+                    if not path or not os.path.isfile(path):
+                        track_state.pop(sequence_key, None)
+                        continue
+                    track_paths.add(path)
+                if not track_state:
+                    state['tracks'].pop(label, None)
+
+            for window_key, window_state in list((state.get('windows') or {}).items()):
+                if window_state.get('status') != 'completed':
+                    continue
+                written_tracks = window_state.get('written_tracks') or {}
+                written_paths = {
+                    item.get('path')
+                    for entries in written_tracks.values()
+                    for item in entries
+                    if item.get('path')
+                }
+                if written_paths and not written_paths.issubset(track_paths):
+                    window_state['status'] = 'pending'
+                    window_state.pop('error', None)
 
         def _save_window_state(self, state_path, state):
             temp_path = f'{state_path}.tmp'
@@ -1431,6 +1645,58 @@ else:
                 'elapsed': elapsed,
             }, info_dict)
 
+        def _build_merge_progress_context(self, format_key, warmup, track_state, filename, label, total_sequences):
+            fmt = (warmup.formats or {}).get(format_key) or {}
+            info_dict = fmt.get('info_dict') or {}
+            if filename and not info_dict.get('_filename'):
+                info_dict['_filename'] = filename
+            merge_data_bytes = sum(
+                item.get('size', 0)
+                for sequence_key, item in track_state.items()
+                if sequence_key != 'init'
+            )
+            init_bytes = (track_state.get('init') or {}).get('size', 0)
+            return {
+                'filename': filename,
+                'info_dict': info_dict,
+                'label': label,
+                'total_sequences': total_sequences,
+                'merge_data_bytes': merge_data_bytes,
+                'init_bytes': init_bytes,
+            }
+
+        def _report_track_merge_progress(
+            self,
+            progress_ctx,
+            merged_bytes,
+            total_bytes,
+            merge_start_time,
+            *,
+            stage,
+            item_index=None,
+            item_count=None,
+        ):
+            info_dict = progress_ctx.get('info_dict') or {}
+            filename = progress_ctx.get('filename')
+            elapsed = max(0.001, time.time() - merge_start_time)
+            speed = merged_bytes / elapsed if merged_bytes > 0 else None
+            eta = None
+            if total_bytes and speed and total_bytes >= merged_bytes:
+                eta = (total_bytes - merged_bytes) / speed
+            self._hook_progress({
+                'status': 'downloading',
+                'phase': 'merging',
+                'merge_stage': stage,
+                'downloaded_bytes': merged_bytes,
+                'total_bytes': total_bytes,
+                'filename': filename,
+                'eta': eta,
+                'speed': speed,
+                'elapsed': elapsed,
+                'fragment_index': item_index,
+                'fragment_count': item_count,
+            }, info_dict)
+
         def _merge_window_track(self, config, state, segment_dir, warmup):
             merged_outputs = {}
             all_tracks_complete = True
@@ -1468,13 +1734,18 @@ else:
                     all_tracks_complete = False
                     continue
 
+                progress_ctx = self._build_merge_progress_context(
+                    format_key, warmup, track_state, filename, label, len(sequence_numbers)
+                )
+
                 # 使用并发合并功能
                 final_output = self._concurrent_merge_track(
                     config=config,
                     track_state=track_state,
                     filename=filename,
                     label=label,
-                    sequence_numbers=sequence_numbers
+                    sequence_numbers=sequence_numbers,
+                    progress_ctx=progress_ctx,
                 )
                 
                 merged_outputs[label] = final_output
@@ -1624,14 +1895,11 @@ else:
             """
             计算最优合并并发数（带优雅降级）
             """
-            try:
-                import psutil
-                # 使用完整算法（如果有psutil）
+            if psutil is not None:
                 return self._calculate_concurrency_with_psutil(total_sequences, total_size_bytes, label)
-            except ImportError:
-                # 使用简化算法（无psutil）
-                self.to_screen(f'[sabr-merge] psutil not available, using simplified algorithm for {label}')
-                return self._calculate_simple_concurrency(total_sequences, total_size_bytes, label)
+            # 使用简化算法（无psutil）
+            self.to_screen(f'[sabr-merge] psutil not available, using simplified algorithm for {label}')
+            return self._calculate_simple_concurrency(total_sequences, total_size_bytes, label)
 
         def _calculate_concurrency_with_psutil(self, total_sequences, total_size_bytes=None, label=""):
             """
@@ -1651,7 +1919,6 @@ else:
             # 检查/tmp目录或工作目录所在文件系统
             disk_type = 'hdd'  # 默认保守假设为机械硬盘
             try:
-                import psutil
                 disk_partitions = psutil.disk_partitions()
                 for partition in disk_partitions:
                     if partition.mountpoint in ['/', '/tmp', os.path.expanduser('~')]:
@@ -1758,14 +2025,14 @@ else:
             
             return concurrency
 
-        def _concurrent_merge_track(self, config, track_state, filename, label, sequence_numbers):
+        def _concurrent_merge_track(self, config, track_state, filename, label, sequence_numbers, progress_ctx=None):
             """
             并发合并单个轨道
             返回：最终输出文件路径
             """
             if not config.get('enable_concurrent_merge', True):
                 # 禁用并发合并，使用原始顺序合并
-                return self._sequential_merge_track(track_state, filename, sequence_numbers)
+                return self._sequential_merge_track(track_state, filename, sequence_numbers, progress_ctx=progress_ctx)
             
             # 计算最优并发数
             total_sequences = len(sequence_numbers)
@@ -1789,7 +2056,7 @@ else:
             # 如果并发数为1或文件太少，使用顺序合并
             if merge_concurrency <= 1 or total_sequences < 10:
                 self.to_screen(f'[sabr-merge] {label}: sequential merge (files={total_sequences})')
-                return self._sequential_merge_track(track_state, filename, sequence_numbers)
+                return self._sequential_merge_track(track_state, filename, sequence_numbers, progress_ctx=progress_ctx)
             
             # 记录并发合并信息
             self.to_screen(
@@ -1806,23 +2073,61 @@ else:
             groups = self._group_sequences_for_concurrent_merge(
                 sequence_numbers, merge_concurrency
             )
+
+            merge_start_time = time.time()
+            merge_data_bytes = (progress_ctx or {}).get('merge_data_bytes', total_size_bytes)
+            init_bytes = (progress_ctx or {}).get('init_bytes', 0)
+            total_progress_bytes = (merge_data_bytes * 2) + init_bytes
+            total_progress_items = total_sequences + len([group for group in groups if group]) + (1 if init_bytes else 0) + 1
+            progress_state = {
+                'bytes_done': 0,
+                'items_done': 0,
+            }
+            progress_lock = threading.Lock()
+
+            self._report_track_merge_progress(
+                progress_ctx or {},
+                0,
+                total_progress_bytes,
+                merge_start_time,
+                stage='prepare',
+                item_index=0,
+                item_count=total_progress_items,
+            )
+
+            def report_progress(bytes_delta, *, stage):
+                with progress_lock:
+                    progress_state['bytes_done'] += bytes_delta
+                    progress_state['items_done'] += 1
+                    bytes_done = progress_state['bytes_done']
+                    items_done = progress_state['items_done']
+                self._report_track_merge_progress(
+                    progress_ctx or {},
+                    bytes_done,
+                    total_progress_bytes,
+                    merge_start_time,
+                    stage=stage,
+                    item_index=items_done,
+                    item_count=total_progress_items,
+                )
             
             # 并发合并到中间文件
             self._merge_to_intermediate_files_concurrently(
-                track_state, groups, intermediate_files, label
+                track_state, groups, intermediate_files, label, report_progress
             )
             
             # 合并中间文件到最终文件
             final_output = self._merge_intermediate_files_to_final(
-                intermediate_files, filename, label, track_state
+                intermediate_files, filename, label, track_state, report_progress
             )
+            report_progress(0, stage='rename')
             
             # 清理中间文件
             self._cleanup_intermediate_files(intermediate_files)
             
             return final_output
 
-        def _sequential_merge_track(self, track_state, filename, sequence_numbers):
+        def _sequential_merge_track(self, track_state, filename, sequence_numbers, progress_ctx=None):
             """
             顺序合并轨道（原始实现）
             """
@@ -1831,11 +2136,44 @@ else:
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
 
+            merge_start_time = time.time()
+            init_bytes = (track_state.get('init') or {}).get('size', 0)
+            total_progress_bytes = init_bytes + sum(
+                track_state.get(str(sequence_number), {}).get('size', 0)
+                for sequence_number in sequence_numbers
+            )
+            total_progress_items = len(sequence_numbers) + (1 if init_bytes else 0) + 1
+            bytes_done = 0
+            items_done = 0
+
+            self._report_track_merge_progress(
+                progress_ctx or {},
+                0,
+                total_progress_bytes,
+                merge_start_time,
+                stage='prepare',
+                item_index=0,
+                item_count=total_progress_items,
+            )
+
+            loop_end_time = merge_start_time
             with open(temp_output, 'wb') as out_fp:
                 init_info = track_state.get('init')
                 if init_info and os.path.isfile(init_info['path']):
                     with open(init_info['path'], 'rb') as in_fp:
-                        out_fp.write(in_fp.read())
+                        payload = in_fp.read()
+                        out_fp.write(payload)
+                    bytes_done += len(payload)
+                    items_done += 1
+                    self._report_track_merge_progress(
+                        progress_ctx or {},
+                        bytes_done,
+                        total_progress_bytes,
+                        merge_start_time,
+                        stage='init',
+                        item_index=items_done,
+                        item_count=total_progress_items,
+                    )
 
                 for sequence_number in sequence_numbers:
                     record = track_state.get(str(sequence_number))
@@ -1845,9 +2183,42 @@ else:
                     if not path or not os.path.isfile(path):
                         continue
                     with open(path, 'rb') as in_fp:
-                        out_fp.write(in_fp.read())
+                        payload = in_fp.read()
+                        out_fp.write(payload)
+                    bytes_done += len(payload)
+                    items_done += 1
+                    self._report_track_merge_progress(
+                        progress_ctx or {},
+                        bytes_done,
+                        total_progress_bytes,
+                        merge_start_time,
+                        stage='parts',
+                        item_index=items_done,
+                        item_count=total_progress_items,
+                    )
+                loop_end_time = time.time()
 
+            close_done_time = time.time()
+            items_done += 1
+            self._report_track_merge_progress(
+                progress_ctx or {},
+                bytes_done,
+                total_progress_bytes,
+                merge_start_time,
+                stage='finalize',
+                item_index=items_done,
+                item_count=total_progress_items,
+            )
+
+            rename_start_time = time.time()
             self.try_rename(temp_output, self.undo_temp_name(temp_output))
+            rename_done_time = time.time()
+            self.to_screen(
+                f'[sabr-merge] sequential finalize: close={close_done_time - loop_end_time:.2f}s '
+                f'rename={rename_done_time - rename_start_time:.2f}s '
+                f'total={rename_done_time - merge_start_time:.2f}s '
+                f'file={self.undo_temp_name(temp_output)}'
+            )
             return self.undo_temp_name(temp_output)
 
         def _create_intermediate_files(self, config, filename, concurrency, label):
@@ -1898,7 +2269,7 @@ else:
 
             return groups
 
-        def _merge_to_intermediate_files_concurrently(self, track_state, groups, intermediate_files, label):
+        def _merge_to_intermediate_files_concurrently(self, track_state, groups, intermediate_files, label, report_progress=None):
             """
             并发合并到中间文件
             """
@@ -1906,6 +2277,7 @@ else:
             
             def merge_group(group, intermediate_file):
                 """合并单个分组到中间文件"""
+                merged_bytes = 0
                 with open(intermediate_file, 'wb') as out_fp:
                     for sequence_number in group:
                         record = track_state.get(str(sequence_number))
@@ -1915,8 +2287,12 @@ else:
                         if not path or not os.path.isfile(path):
                             continue
                         with open(path, 'rb') as in_fp:
-                            out_fp.write(in_fp.read())
-                return len(group)
+                            payload = in_fp.read()
+                            out_fp.write(payload)
+                        merged_bytes += len(payload)
+                        if report_progress:
+                            report_progress(len(payload), stage='parts')
+                return len(group), merged_bytes
             
             # 使用线程池并发合并
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as executor:
@@ -1934,16 +2310,16 @@ else:
                 for future in concurrent.futures.as_completed(future_to_group):
                     i, group_size = future_to_group[future]
                     try:
-                        merged_count = future.result()
+                        merged_count, merged_bytes = future.result()
                         completed += merged_count
                         self.to_screen(
                             f'[sabr-merge] group {i}: merged {merged_count}/{group_size} files '
-                            f'({completed}/{total} total, {completed/total*100:.1f}%)'
+                            f'({completed}/{total} total, {completed/total*100:.1f}%, {merged_bytes} bytes)'
                         )
                     except Exception as e:
                         self.to_screen(f'[sabr-merge] error in group {i}: {e}')
 
-        def _merge_intermediate_files_to_final(self, intermediate_files, filename, label, track_state=None):
+        def _merge_intermediate_files_to_final(self, intermediate_files, filename, label, track_state=None, report_progress=None):
             """
             合并中间文件到最终文件
             参数:
@@ -1957,6 +2333,7 @@ else:
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
 
+            merge_start_time = time.time()
             with open(temp_output, 'wb') as out_fp:
                 # 首先写入init段（如果有）
                 if track_state:
@@ -1964,7 +2341,10 @@ else:
                     if init_info and os.path.isfile(init_info.get('path', '')):
                         try:
                             with open(init_info['path'], 'rb') as in_fp:
-                                out_fp.write(in_fp.read())
+                                payload = in_fp.read()
+                                out_fp.write(payload)
+                            if report_progress:
+                                report_progress(len(payload), stage='finalize')
                             self.to_screen(f'[sabr-merge] {label}: wrote init segment')
                         except Exception as e:
                             self.to_screen(f'[sabr-merge] {label}: error writing init segment: {e}')
@@ -1974,14 +2354,25 @@ else:
                     if os.path.exists(intermediate_file):
                         try:
                             with open(intermediate_file, 'rb') as in_fp:
-                                out_fp.write(in_fp.read())
+                                payload = in_fp.read()
+                                out_fp.write(payload)
+                            if report_progress:
+                                report_progress(len(payload), stage='finalize')
                         except Exception as e:
                             self.to_screen(f'[sabr-merge] {label}: error merging {intermediate_file}: {e}')
 
+            close_done_time = time.time()
+            rename_start_time = time.time()
             self.try_rename(temp_output, self.undo_temp_name(temp_output))
             final_output = self.undo_temp_name(temp_output)
+            rename_done_time = time.time()
 
             self.to_screen(f'[sabr-merge] {label}: merged {len(intermediate_files)} intermediate files to final output')
+            self.to_screen(
+                f'[sabr-merge] {label}: finalize close={close_done_time - merge_start_time:.2f}s '
+                f'rename={rename_done_time - rename_start_time:.2f}s '
+                f'total={rename_done_time - merge_start_time:.2f}s'
+            )
 
             return final_output
 
