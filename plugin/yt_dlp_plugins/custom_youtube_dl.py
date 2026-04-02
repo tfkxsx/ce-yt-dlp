@@ -2,6 +2,7 @@ from yt_dlp import YoutubeDL as _YoutubeDL
 from yt_dlp.utils import subtitles_filename
 from yt_dlp.downloader import get_suitable_downloader
 from yt_dlp_plugins.downloader.http import HttpFD
+from yt_dlp_plugins.downloader.sabr import SabrFD
 from yt_dlp_plugins.error import error_codes
 
 
@@ -161,6 +162,10 @@ class CustomYoutubeDL(_YoutubeDL):
         if fd_class.FD_NAME == "http":
             self.write_debug(f"[CustomYoutubeDL] handling --> dl : http")
             fd_class = HttpFD
+        elif fd_class.FD_NAME == "sabr" and not self.params.get("sabr_concurrency", {}).get("enabled"):
+            self.write_debug(f"[CustomYoutubeDL] handling --> dl : sabr")
+            # 这里可以替换为自定义的 SABR 下载器
+            fd_class = SabrFD
         fd = fd_class(self, params)
         if not test:
             for ph in self._progress_hooks:
