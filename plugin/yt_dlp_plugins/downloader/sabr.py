@@ -6,6 +6,7 @@ import dataclasses
 import itertools
 import json
 import os
+import shutil
 import statistics
 import threading
 import time
@@ -221,6 +222,7 @@ else:
                 # 新增：动态窗口规划器配置
                 'window_planning_mode': raw.get('window_planning_mode', 'interleaved'),  # 'sequential', 'interleaved', 'adaptive'
                 'interleaving_enabled': raw.get('interleaving_enabled', True),
+                'window_overlap_segments': raw.get('window_overlap_segments', 1),
                 'adaptive_threshold_success': raw.get('adaptive_threshold_success', 0.8),  # 成功率阈值
                 'adaptive_threshold_response_ms': raw.get('adaptive_threshold_response_ms', 5000),  # 响应时间阈值
                 'priority_scheduling_enabled': raw.get('priority_scheduling_enabled', True),
@@ -228,6 +230,7 @@ else:
                 'merge_concurrency': raw.get('merge_concurrency'),  # 合并并发数，None表示自动计算
                 'enable_concurrent_merge': raw.get('enable_concurrent_merge', True),  # 是否启用并发合并
                 'intermediate_file_prefix': raw.get('intermediate_file_prefix', '.sabr_merge_'),  # 中间文件前缀
+                'merge_copy_buffer_size': raw.get('merge_copy_buffer_size', 1024 * 1024),
             }
 
         def _build_track_selectors(self, video_format, audio_format, caption_format):
@@ -703,16 +706,23 @@ else:
 
             # 动态计算窗口大小和起始位置
             window_size = stride  # 检测到的窗口大小（服务器返回的连续片段数）
-            window_stride = 1  # 窗口之间的步长应该是1，确保完全覆盖
+            window_overlap = max(0, min(config.get('window_overlap_segments', 1), max(0, window_size - 1)))
+            # 主下载阶段保留少量重叠，用 repair 阶段兜底，而不是用全量 dense 扫描制造大量 duplicates。
+            window_stride = max(1, window_size - window_overlap)
             
             # 计算需要多少个窗口来覆盖所有片段
             if config['window_count'] is not None:
                 window_count = max(0, config['window_count'])
             elif total_segments:
-                # 默认按窗口跨度推进，降低重复窗口；repair阶段负责兜底补洞。
+                # 主下载按「窗口大小 - overlap」推进，减少重复请求；repair阶段负责补洞。
                 window_count = ((total_segments - sample_target) // window_stride) + 1
             else:
                 raise DownloadError('window_count is required when total_segments is unavailable')
+
+            self.to_screen(
+                f'[sabr-window] plan basis: window_size={window_size} overlap={window_overlap} '
+                f'window_stride={window_stride} window_count={window_count}'
+            )
 
             # 使用动态窗口规划器生成窗口序列
             targets = self._generate_window_plan(
@@ -2025,6 +2035,30 @@ else:
             
             return concurrency
 
+        def _recommended_merge_concurrency_floor(self, total_sequences, total_size_bytes=None):
+            if total_sequences < 32:
+                return 1
+            avg_size_mb = 0
+            if total_size_bytes and total_sequences > 0:
+                avg_size_mb = total_size_bytes / (1024 ** 2) / total_sequences
+            # 小 part 很多时，至少给 2~4 路并发，否则 merge 往往退化成单线程长尾。
+            if total_sequences >= 128 and avg_size_mb <= 8:
+                return 4
+            if total_sequences >= 64 and avg_size_mb <= 16:
+                return 3
+            return 2
+
+        def _append_file_to_fp(self, src_path, out_fp, buffer_size):
+            written = 0
+            with open(src_path, 'rb') as in_fp:
+                while True:
+                    chunk = in_fp.read(buffer_size)
+                    if not chunk:
+                        break
+                    out_fp.write(chunk)
+                    written += len(chunk)
+            return written
+
         def _concurrent_merge_track(self, config, track_state, filename, label, sequence_numbers, progress_ctx=None):
             """
             并发合并单个轨道
@@ -2049,6 +2083,8 @@ else:
                 merge_concurrency = self._calculate_optimal_merge_concurrency(
                     total_sequences, total_size_bytes, label
                 )
+            merge_floor = self._recommended_merge_concurrency_floor(total_sequences, total_size_bytes)
+            merge_concurrency = max(merge_floor, merge_concurrency)
             
             # 边界检查
             merge_concurrency = max(1, min(merge_concurrency, total_sequences))
@@ -2056,7 +2092,9 @@ else:
             # 如果并发数为1或文件太少，使用顺序合并
             if merge_concurrency <= 1 or total_sequences < 10:
                 self.to_screen(f'[sabr-merge] {label}: sequential merge (files={total_sequences})')
-                return self._sequential_merge_track(track_state, filename, sequence_numbers, progress_ctx=progress_ctx)
+                return self._sequential_merge_track(
+                    track_state, filename, sequence_numbers, progress_ctx=progress_ctx,
+                    buffer_size=config.get('merge_copy_buffer_size', 1024 * 1024))
             
             # 记录并发合并信息
             self.to_screen(
@@ -2113,12 +2151,14 @@ else:
             
             # 并发合并到中间文件
             self._merge_to_intermediate_files_concurrently(
-                track_state, groups, intermediate_files, label, report_progress
+                track_state, groups, intermediate_files, label, report_progress,
+                buffer_size=config.get('merge_copy_buffer_size', 1024 * 1024),
             )
             
             # 合并中间文件到最终文件
             final_output = self._merge_intermediate_files_to_final(
-                intermediate_files, filename, label, track_state, report_progress
+                intermediate_files, filename, label, track_state, report_progress,
+                buffer_size=config.get('merge_copy_buffer_size', 1024 * 1024),
             )
             report_progress(0, stage='rename')
             
@@ -2127,7 +2167,7 @@ else:
             
             return final_output
 
-        def _sequential_merge_track(self, track_state, filename, sequence_numbers, progress_ctx=None):
+        def _sequential_merge_track(self, track_state, filename, sequence_numbers, progress_ctx=None, buffer_size=1024 * 1024):
             """
             顺序合并轨道（原始实现）
             """
@@ -2160,10 +2200,7 @@ else:
             with open(temp_output, 'wb') as out_fp:
                 init_info = track_state.get('init')
                 if init_info and os.path.isfile(init_info['path']):
-                    with open(init_info['path'], 'rb') as in_fp:
-                        payload = in_fp.read()
-                        out_fp.write(payload)
-                    bytes_done += len(payload)
+                    bytes_done += self._append_file_to_fp(init_info['path'], out_fp, buffer_size)
                     items_done += 1
                     self._report_track_merge_progress(
                         progress_ctx or {},
@@ -2182,10 +2219,7 @@ else:
                     path = record.get('path')
                     if not path or not os.path.isfile(path):
                         continue
-                    with open(path, 'rb') as in_fp:
-                        payload = in_fp.read()
-                        out_fp.write(payload)
-                    bytes_done += len(payload)
+                    bytes_done += self._append_file_to_fp(path, out_fp, buffer_size)
                     items_done += 1
                     self._report_track_merge_progress(
                         progress_ctx or {},
@@ -2269,7 +2303,7 @@ else:
 
             return groups
 
-        def _merge_to_intermediate_files_concurrently(self, track_state, groups, intermediate_files, label, report_progress=None):
+        def _merge_to_intermediate_files_concurrently(self, track_state, groups, intermediate_files, label, report_progress=None, buffer_size=1024 * 1024):
             """
             并发合并到中间文件
             """
@@ -2286,12 +2320,10 @@ else:
                         path = record.get('path')
                         if not path or not os.path.isfile(path):
                             continue
-                        with open(path, 'rb') as in_fp:
-                            payload = in_fp.read()
-                            out_fp.write(payload)
-                        merged_bytes += len(payload)
+                        written = self._append_file_to_fp(path, out_fp, buffer_size)
+                        merged_bytes += written
                         if report_progress:
-                            report_progress(len(payload), stage='parts')
+                            report_progress(written, stage='parts')
                 return len(group), merged_bytes
             
             # 使用线程池并发合并
@@ -2319,7 +2351,7 @@ else:
                     except Exception as e:
                         self.to_screen(f'[sabr-merge] error in group {i}: {e}')
 
-        def _merge_intermediate_files_to_final(self, intermediate_files, filename, label, track_state=None, report_progress=None):
+        def _merge_intermediate_files_to_final(self, intermediate_files, filename, label, track_state=None, report_progress=None, buffer_size=1024 * 1024):
             """
             合并中间文件到最终文件
             参数:
@@ -2340,11 +2372,9 @@ else:
                     init_info = track_state.get('init')
                     if init_info and os.path.isfile(init_info.get('path', '')):
                         try:
-                            with open(init_info['path'], 'rb') as in_fp:
-                                payload = in_fp.read()
-                                out_fp.write(payload)
+                            written = self._append_file_to_fp(init_info['path'], out_fp, buffer_size)
                             if report_progress:
-                                report_progress(len(payload), stage='finalize')
+                                report_progress(written, stage='finalize')
                             self.to_screen(f'[sabr-merge] {label}: wrote init segment')
                         except Exception as e:
                             self.to_screen(f'[sabr-merge] {label}: error writing init segment: {e}')
@@ -2353,11 +2383,9 @@ else:
                 for intermediate_file in intermediate_files:
                     if os.path.exists(intermediate_file):
                         try:
-                            with open(intermediate_file, 'rb') as in_fp:
-                                payload = in_fp.read()
-                                out_fp.write(payload)
+                            written = self._append_file_to_fp(intermediate_file, out_fp, buffer_size)
                             if report_progress:
-                                report_progress(len(payload), stage='finalize')
+                                report_progress(written, stage='finalize')
                         except Exception as e:
                             self.to_screen(f'[sabr-merge] {label}: error merging {intermediate_file}: {e}')
 
