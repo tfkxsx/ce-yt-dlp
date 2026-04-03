@@ -166,14 +166,16 @@ class CustomYoutubeDL(_YoutubeDL):
         """
         根据文件大小调整SABR并发配置
         逻辑：
-        - 文件大小 ≥ 10MB：启用并发，使用用户指定的thread_number或默认4并发
         - 文件大小 < 10MB：禁用并发，使用原始SABR下载（无并发）
         - 文件大小为0：视为无法获取大小，保持现有配置
+        - 10MB < 文件大小 <= 50MB：启用并发，使用用户指定的thread_number或默认2并发
+        - 文件大小 > 50MB：启用并发，使用用户指定的thread_number或默认4并发
         """
         total_bytes = self._calculate_total_filesize(info_dict)
         
         MB = 1024 * 1024
-        threshold = 10 * MB  # 10MB阈值
+        enable_threshold = 10 * MB
+        high_threshold = 50 * MB
         
         # 获取或初始化sabr_concurrency配置
         sabr_config = self.params.get('sabr_concurrency', {})
@@ -187,18 +189,24 @@ class CustomYoutubeDL(_YoutubeDL):
         
         file_size_mb = total_bytes / MB
         
-        if total_bytes >= threshold:
-            # ≥10MB：启用并发
-            sabr_config['enabled'] = True
-            
-            # 使用用户指定的thread_number或默认4
+        if total_bytes >= enable_threshold:
+            # >=10MB：启用并发
+            default_thread_number = 4 if total_bytes > high_threshold else 2
+
+            # 使用用户指定的thread_number或按分档设置默认值
             if 'thread_number' not in sabr_config:
-                sabr_config['thread_number'] = 4
-            
-            self.to_screen(
-                f'[sabr-auto] 文件大小 {file_size_mb:.1f}MB ≥ 10MB，'
-                f'启用{sabr_config["thread_number"]}并发下载'
-            )
+                sabr_config['thread_number'] = default_thread_number
+
+            if total_bytes > high_threshold:
+                self.to_screen(
+                    f'[sabr-auto] 文件大小 {file_size_mb:.1f}MB > 50MB，'
+                    f'启用{sabr_config["thread_number"]}并发下载'
+                )
+            else:
+                self.to_screen(
+                    f'[sabr-auto] 文件大小 {file_size_mb:.1f}MB 在 10MB-50MB 区间，'
+                    f'启用{sabr_config["thread_number"]}并发下载'
+                )
         else:
             # <10MB：禁用并发
             sabr_config['enabled'] = False
