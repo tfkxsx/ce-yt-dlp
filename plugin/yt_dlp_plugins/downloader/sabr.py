@@ -125,7 +125,7 @@ else:
             reload_config_fn: callable | None = None,
             heartbeat_callback: callable | None = None,
             client_info=None,
-            start_time_ms: int = 0,
+            live_from_start: bool = False,
             target_duration_sec: int | None = None,
             live_status: str | None = None,
         ):
@@ -146,7 +146,7 @@ else:
                     reload_config_fn=reload_config_fn,
                     heartbeat_callback=heartbeat_callback,
                     client_info=client_info,
-                    start_time_ms=start_time_ms,
+                    live_from_start=live_from_start,
                     target_duration_sec=target_duration_sec,
                     live_status=live_status,
                 )
@@ -180,7 +180,7 @@ else:
                 reload_config_fn=reload_config_fn,
                 heartbeat_callback=heartbeat_callback,
                 client_info=client_info,
-                start_time_ms=start_time_ms,
+                start_time_ms=0,
                 target_duration_sec=target_duration_sec,
                 live_status=live_status,
                 video_id=video_id,

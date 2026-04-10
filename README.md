@@ -35,9 +35,11 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 使用自定义功能必须先开启 use_custom_youtube_dl 总开关
 
 ```bash
+
 use_custom_youtube_dl                 自定义功能总开关, 默认关闭状态（False）使用原生 YoutubeDL功能，设置为True 开启自定义功能。
 use_custom_writeautomaticsub          多字幕下载时写入字幕失败仅告警并继续下一条，默认关闭状态（False）， 设置为True 开启。
 sabr_concurrency                      sabr 并发下载参数, 详细见 "SABR ARGUMENTS" 部分
+
 ```
 
 
@@ -46,11 +48,13 @@ sabr_concurrency                      sabr 并发下载参数, 详细见 "SABR A
 使用自定义提取器选项必须先开启 use_custom_plugins 总开关
 
 ```bash
+
 use_custom_plugins                    自定义插件总开关, 默认关闭状态（False）使用原生 YoutubeIE功能，设置为True 开启自定义功能。
 use_custom_player_client              自定义播放器客户端列表，例如：["tv", "web_safari", "android_sdkless"], 注意此功能优先级高于原生: extractor_args的设置
 use_custom_download_webpage_handle    自定义web页面下载程序开关，在原生下载器出问题时可进行切换。默认关闭状态（False）， 设置为True 开启。
 use_custom_sabr                       指定使用 player 生成 potoken的客户端，例如：["web_safari"]，多个客户端使用逗号（,）分割
-use_custom_jsc                        使用插件自带的 yt.solver.core.js 脚本对 n/sig 重签名, 设置为True 开启。
+youtube-ejs                           yt-dlp 开发者模式解决ejs 签名（ n/sig 重签名）, 详细见 "youtube-ejs" 部分
+
 ```
 - [use_custom_jsc 详情](plugin/yt_dlp_plugins/docs/custom_ejs.md)
 
@@ -81,6 +85,30 @@ sabr 并发下载参数， 接受一个 dict 对象如 `sabr_concurrency: {}`
 | `merge_copy_buffer_size` | 合并拷贝缓冲区大小 | `1 MiB` |
 
 - [sabr 并发下载详细说明](plugin/yt_dlp_plugins/docs/sabr并发详解.md)
+
+
+### youtube-ejs
+youtube-ejs 是yt-dlp 原生自带功能， 这里利用其特性来加载自定义的ejs `yt.solver.core.min.js` 脚本， 接受一个 dict 对象如 `youtube-ejs: {}`
+
+| 配置项 | 作用 | 默认值 |
+|---|---|---:|
+| `dev` | 是否启用并发 SABR 下载 | `["true"]` |
+| `repo` | 是否启用并发 SABR 下载 | `["tfkxsx/tfkxsx-yt-dlp-ejs"]` |
+| `script_version` | 是否启用并发 SABR 下载 | `["0.0.1"]` |
+
+注意：由于`yt.solver.core.min.js` 脚本更新很快， 所有一般需要额外配置两个 `extractor_args` 参数：
+```json
+{
+    "extractor_args": {
+        "youtube": {
+            "player_js_version": ['20521@18d29a11'],
+            "player_js_variant": ["es6"],
+        }
+    }
+}
+```
+- yt.solver.core.min.js 版本号：18d29a11； signatureTimestamp：20521
+- 当前版本来源平台： es6
 
 
 ## 自定义功能
