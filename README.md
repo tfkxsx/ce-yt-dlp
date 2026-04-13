@@ -94,11 +94,18 @@ youtube-ejs 是yt-dlp 原生自带功能， 这里利用其特性来加载自定
 |---|---|---:|
 | `dev` | 是否启用并发 SABR 下载 | `["true"]` |
 | `repo` | 是否启用并发 SABR 下载 | `["tfkxsx/tfkxsx-yt-dlp-ejs"]` |
-| `script_version` | 是否启用并发 SABR 下载 | `["0.0.1"]` |
+| `script_version` | 是否启用并发 SABR 下载 | `[[version]]` |
 
-注意：由于`yt.solver.core.min.js` 脚本更新很快， 所有一般需要额外配置两个 `extractor_args` 参数：
+注意：由于`yt.solver.core.min.js` 脚本更新很快， 所有一般需要额外配置两个 `extractor_args` 参数。
+
+**使用示例**：
 ```json
-{
+{   
+    "youtube-ejs": {
+        "dev": ["true"],
+        "repo": ["tfkxsx/tfkxsx-yt-dlp-ejs"],
+        "script_version": ["0.0.2"],
+    },
     "extractor_args": {
         "youtube": {
             "player_js_version": ['20521@18d29a11'],
