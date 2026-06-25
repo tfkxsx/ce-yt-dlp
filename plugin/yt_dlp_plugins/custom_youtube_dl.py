@@ -2,7 +2,7 @@ from yt_dlp import YoutubeDL as _YoutubeDL
 from yt_dlp.utils import subtitles_filename
 from yt_dlp.downloader import get_suitable_downloader
 from yt_dlp_plugins.downloader.http import HttpFD
-from yt_dlp_plugins.downloader.sabr import SabrFD
+# from yt_dlp_plugins.downloader.sabr import SabrFD
 from yt_dlp_plugins.error import error_codes
 
 
