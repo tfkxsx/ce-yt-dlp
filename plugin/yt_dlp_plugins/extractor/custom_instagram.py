@@ -32,7 +32,7 @@ class InstagramIE(_InstagramIE):
 
     @property
     def enable_custom(self):
-        return self.get_param("use_custom_plugins", False)
+        return self.get_param("use_custom_plugins", True)
 
     @property
     def _is_logged_in(self):

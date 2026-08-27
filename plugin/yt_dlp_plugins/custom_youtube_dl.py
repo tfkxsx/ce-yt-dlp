@@ -2,7 +2,11 @@ from yt_dlp import YoutubeDL as _YoutubeDL
 from yt_dlp.utils import subtitles_filename
 from yt_dlp.downloader import get_suitable_downloader
 from yt_dlp_plugins.downloader.http import HttpFD
-# from yt_dlp_plugins.downloader.sabr import SabrFD
+try:
+    from yt_dlp_plugins.downloader.sabr import SabrFD
+except Exception as e:
+    print("The current branch does not support sabr. Use the branch project that " \
+    "requires switching: https://github.com/coletdjnz/yt-dlp-dev.git under the feat/youtube/sabr branch.")
 from yt_dlp_plugins.error import error_codes
 
 
@@ -16,7 +20,7 @@ class CustomYoutubeDL(_YoutubeDL):
         """
         params = params or {}
         # 提前取出开关，避免父类 __init__ 处理未知参数
-        self.enable_custom = params.pop("use_custom_youtube_dl", False)
+        self.enable_custom = params.pop("use_custom_youtube_dl", True)
         super().__init__(params, *args, **kwargs)
 
     def __getattribute__(self, name):

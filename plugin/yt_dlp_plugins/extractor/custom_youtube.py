@@ -21,7 +21,7 @@ class YoutubeIE(_YoutubeIE):
 
     @property
     def enable_custom(self):
-        return self.get_param("use_custom_plugins", False)
+        return self.get_param("use_custom_plugins", True)
 
     def _get_requested_clients(self, url, smuggled_data, is_premium_subscriber):
         use_custom_player_client = self.get_param("use_custom_player_client")

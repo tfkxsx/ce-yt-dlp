@@ -1,0 +1,83 @@
+{
+  "info": {
+    "_postman_id": "f1c7df5d-b4f5-4e33-8db2-9fca99a99930",
+    "name": "Vimeo Player Diagnostic",
+    "description": "Diagnostic request for comparing Postman/Newman behavior with Python clients. The collection intentionally does not hard-code temporary Cloudflare cookies.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "video_id",
+      "value": "1087715186",
+      "type": "string"
+    },
+    {
+      "key": "player_host",
+      "value": "player.vimeo.com",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "GET Vimeo player",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "*/*",
+            "type": "text"
+          },
+          {
+            "key": "Connection",
+            "value": "keep-alive",
+            "type": "text"
+          },
+          {
+            "key": "User-Agent",
+            "value": "PostmanRuntime/7.56.1",
+            "type": "text"
+          },
+          {
+            "key": "Cookie",
+            "value": "__cf_bm=",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://{{player_host}}/video/{{video_id}}",
+          "protocol": "https",
+          "host": [
+            "{{player_host}}"
+          ],
+          "path": [
+            "video",
+            "{{video_id}}"
+          ]
+        },
+        "description": "The Cookie header is intentionally omitted. Newman/Postman will use the active Cookie Jar and persist Set-Cookie values for the run."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const response = pm.response || {};",
+              "const body = typeof response.text === 'function' ? (response.text() || '') : '';",
+              "const getHeader = (name) => response.headers && typeof response.headers.get === 'function' ? (response.headers.get(name) || '') : '';",
+              "const status = typeof response.code === 'number' ? response.code : null;",
+              "const contentType = getHeader('content-type');",
+              "const server = getHeader('server');",
+              "const cfRay = getHeader('cf-ray');",
+              "const challenge = /cloudflare|turnstile|couldn't verify|checking if the site connection is secure/i.test(body);",
+              "console.log(JSON.stringify({ status, contentType, server, cfRay, bodyLength: body.length, cloudflareChallenge: challenge }));",
+              "pm.test('HTTP response received', function () { pm.expect(status, 'No HTTP response; inspect Newman request error').to.not.eql(null); });",
+              "if (status !== null) { pm.test('Response body is not a Cloudflare challenge', function () { pm.expect(challenge, 'Cloudflare challenge detected').to.eql(false); }); }"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

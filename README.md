@@ -62,7 +62,7 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 
 | 选项 | 默认值 | 说明 |
 | :--- | :---: | :--- |
-| `use_custom_youtube_dl` | `False` | 自定义功能总开关。关闭时使用原生 `YoutubeDL`，设置为 `True` 后启用自定义功能。 |
+| `use_custom_youtube_dl` | `True` | 自定义功能总开关。关闭时使用原生 `YoutubeDL`，设置为 `True` 后启用自定义功能。 |
 | `use_custom_writeautomaticsub` | `False` | 多字幕下载时，单条字幕写入失败仅告警并继续处理下一条。设置为 `True` 后启用。 |
 
 
@@ -73,17 +73,18 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 
 | 选项 | 默认值 | 说明 |
 | :--- | :---: | :--- |
-| `use_custom_plugins` | `False` | 自定义插件总开关。关闭时使用原生 `YoutubeIE`，设置为 `True` 后启用自定义提取器能力。 |
-| `use_custom_player_client` | 无 | 自定义播放器客户端列表，例如 `["tv", "web_safari", "android_sdkless"]`。该选项优先级高于原生 `extractor_args` 设置。 |
+| `use_custom_plugins` | `True` | 自定义插件总开关。关闭时使用原生 `YoutubeIE`，设置为 `True` 后启用自定义提取器能力。 |
 | `use_custom_download_webpage_handle` | `False` | 自定义网页下载程序开关。原生下载器异常时可切换使用，设置为 `True` 后启用。 |
+| `use_custom_player_client` | 无 | 自定义播放器客户端列表，例如 `["tv", "web_safari", "android_sdkless"]`。该选项优先级高于原生 `extractor_args` 设置。 |
 | `use_custom_sabr` | 无 | 指定使用 `player` 生成 `potoken` 的客户端，例如 `["web_safari"]`。多个客户端使用逗号分隔。 |
 | `use_custom_jsc` | `False` | 使用插件自带的 `yt.solver.core.js` 脚本对 `n/sig` 重签名。设置为 `True` 后启用。 |
-| `use_custom_vimeo` | `False` | 使用自定义vimeo插件。设置为 `True` 后启用。 |
 | `use_custom_instagram` | `False` | 使用自定义instagram插件 - 支持1080p下载 。设置为 `True` 后启用。 |
+| `use_custom_tiktok` | `False` | 自定义tiktok 分辨率逻辑（删除yt-dlp 对tiktok分辨率自动计算逻辑）。设置为 `True` 后启用。 |
 
 更多说明：
 
-- [use_custom_jsc 详情](plugin/yt_dlp_plugins/docs/custom_ejs.md)
+- [use_custom_jsc 详情](docs/custom_ejs.md)
+- [use_custom_sabr 详情](docs/sabr并发详解.md)
 
 ## 自定义功能
 
@@ -124,7 +125,7 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 
 更多说明：
 
-- [错误码对照表详情](plugin/yt_dlp_plugins/docs/error_code.md)
+- [错误码对照表详情](docs/error_code.md)
 
 
 ## 自定义提取器
@@ -173,4 +174,4 @@ with CustomYoutubeDL(ydl_opts) as ydl:
 
 更多说明：
 
-- [Hook 点对照表详情](plugin/yt_dlp_plugins/docs/hook_detail.md)
+- [Hook 点对照表详情](docs/hook_detail.md)

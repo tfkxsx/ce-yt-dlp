@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ce-yt-dlp"
-dynamic = ["version"]
-description = "A yt-dlp plugin package (ce)."
-readme = { file = "../README.md", content-type = "text/markdown" }
+version="1.0.0"
+description = "A yt-dpl plugin package (ce)."
+readme = { file = "README.md", content-type = "text/markdown" }
 classifiers = [
   "License :: OSI Approved :: GNU General Public License v3 (GPLv3)"
 ]
@@ -14,7 +14,7 @@ license = { text = "GPL-3.0-only" }
 requires-python = ">=3.10"
 keywords = ["yt-dlp", "yt-dlp-plugin"]
 maintainers = [
-  { name = "tf", email = "tfkxsx@gmail.com" },
+  { name = "tfkxsx", email = "tfkxsx@gmail.com" },
 ]
 dependencies = [
     "yt-dlp",
@@ -22,20 +22,18 @@ dependencies = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["yt_dlp_plugins"]
+packages = ["plugin/yt_dlp_plugins"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-  "../README.md",
+  "README.md",
+  "LICENSE",
   "pyproject.toml",
-  "yt_dlp_plugins/**",
+  "plugin/yt_dlp_plugins/**",
 ]
 
 [tool.hatch.metadata]
 allow-direct-references = true
-
-[tool.hatch.version]
-path = "yt_dlp_plugins/__init__.py"
 
 [tool.ruff.format]
 quote-style = "single"
